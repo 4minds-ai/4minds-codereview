@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+
+gencr() {
+  if [ -z "$1" ]; then
+    echo "Usage: gencr <dev-username>"
+    return 1
+  fi
+
+  local dev="$1"
+  local branch
+  branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" || true
+  local timestamp
+  timestamp=$(date +"%Y%m%d-%H%M%S")
+
+  local input_file="$HOME/.claude/code_review_query.md"
+
+  if [ -z "$branch" ]; then
+    echo "Error: not in a git repo"
+    return 1
+  fi
+
+  if [ ! -f "${input_file}" ]; then
+    echo "Error: ${input_file} not found"
+    return 1
+  fi
+
+  # sanitize branch
+  branch="${branch//\//-}"
+  branch="${branch// /-}"
+
+  # escape for sed
+  esc() {
+    printf '%s\n' "$1" | sed 's/[\/&]/\\&/g'
+  }
+
+  local esc_branch
+  esc_branch="$(esc "$branch")"
+  local esc_dev=$(esc "$dev")
+  local esc_timestamp=$(esc "$timestamp")
+
+  mkdir -p "$HOME/tmp/$dev"
+
+  head -n 1 "${input_file}" | sed \
+    -e "s/{branch-name}/${esc_branch}/g" \
+    -e "s/{dev-username}/${esc_dev}/g" \
+    -e "s/{timestamp}/${esc_timestamp}/g"
+}
+
+gencr "$@"
