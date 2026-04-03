@@ -28,6 +28,8 @@ gencr() {
   local safe_branch="${raw_branch//\//-}"
   safe_branch="${safe_branch// /-}"
 
+  local base_branch="${CODEREVIEW_BASE_BRANCH:-staging}"
+
   # escape for sed
   esc() {
     printf '%s\n' "$1" | sed 's/[\/&]/\\&/g'
@@ -37,6 +39,8 @@ gencr() {
   esc_raw_branch="$(esc "$raw_branch")"
   local esc_safe_branch
   esc_safe_branch="$(esc "$safe_branch")"
+  local esc_base_branch
+  esc_base_branch="$(esc "$base_branch")"
   local esc_dev
   esc_dev="$(esc "$dev")"
   local esc_timestamp
@@ -47,6 +51,7 @@ gencr() {
   head -n 1 "${input_file}" | sed \
     -e "s/{raw-branch}/${esc_raw_branch}/g" \
     -e "s/{safe-branch}/${esc_safe_branch}/g" \
+    -e "s/{base-branch}/${esc_base_branch}/g" \
     -e "s/{dev-username}/${esc_dev}/g" \
     -e "s/{timestamp}/${esc_timestamp}/g"
 }
