@@ -13,13 +13,13 @@ You are performing a structured code review for developer: $1
    - If one exists, load the most recent one and note what has changed or been addressed since then.
 5. Determine the base branch by running:
    ```
-   echo "${CODEREVIEW_BASE_BRANCH:-main}"
+   echo "${CODEREVIEW_BASE_BRANCH:-staging}"
    ```
-   Call this value <base>. Use it in all git commands below.
+   Call this value <base>. Always use `origin/<base>` (the remote tracking ref) in all git commands below — never the local `<base>` branch, which may be stale.
 
 6. Get the list of files to review by running:
    ```
-   git log --no-merges --ancestry-path $(git merge-base <base> HEAD)..HEAD --pretty=format: --name-only | sort -u | grep -v '^$'
+   git log --no-merges --ancestry-path $(git merge-base origin/<base> HEAD)..HEAD --pretty=format: --name-only | sort -u | grep -v '^$'
    ```
    This returns only files touched by commits made directly on this branch — it intentionally excludes merge commits (e.g. merges from staging or other branches). Review only these files.
 
@@ -28,7 +28,7 @@ You are performing a structured code review for developer: $1
 **Only review files returned by the command in step 6.**
 - Do NOT review files that were brought in via merge commits (e.g. `Merge branch 'staging' into <branch>`).
 - Do NOT review files from other branches that were merged into this branch for the purpose of keeping it up to date.
-- If the file list looks unexpectedly large, run `git log --oneline --no-merges <base>..<branch>` to verify only the developer's own commits are in scope, and cross-reference before proceeding.
+- If the file list looks unexpectedly large, run `git log --oneline --no-merges origin/<base>..<branch>` to verify only the developer's own commits are in scope, and cross-reference before proceeding.
 - When in doubt, exclude the file — only include it if a non-merge commit on this branch directly modified it.
 
 ## Output
