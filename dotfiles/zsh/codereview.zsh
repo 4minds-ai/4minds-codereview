@@ -6,6 +6,11 @@ gencrnew() {
   fi
 
   local dev="$1"
+  if [[ "$dev" == *[^A-Za-z0-9._-]* ]]; then
+    echo "Error: dev-username may contain only letters, numbers, dots, underscores, and hyphens"
+    return 1
+  fi
+
   local raw_branch
   raw_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" || true
 
@@ -25,5 +30,50 @@ gencrnew() {
 
   mkdir -p "$HOME/Documents/CodeReview/$dev"
 
-  claude "new task: clear todos/tasks/planning; perform a code review using ~/.claude/CODE_REVIEW.md; write a new report to ~/Documents/CodeReview/${dev}/code-review-${dev}-${safe_branch}-${timestamp}.md; previous reviews may exist at ~/Documents/CodeReview/${dev}/code-review-${dev}-${safe_branch}-*.md; do not update existing reports; GIT BRANCH NOTE: the actual git branch name is '${raw_branch}' — use this name (or HEAD) for ALL git commands; the base branch is 'origin/${base_branch}' (use the remote tracking ref, not the local branch, to avoid stale merge-base); the output file path uses a sanitized version ('${safe_branch}') where slashes are replaced with dashes — do NOT use the sanitized name in git commands; HARD RULE: if any code change lacks new or updated tests, it MUST be reported as a 🔴 BLOCKER (B-*), NEVER Low or Medium, and the final verdict MUST be \"❌ REQUEST CHANGES\"; STRICT SCOPE RULE: only review files touched by commits made directly on this branch — get the file list by running: git log --no-merges --ancestry-path \$(git merge-base 'origin/${base_branch}' HEAD)..HEAD --pretty=format: --name-only | sort -u | grep -v '^\$' — do NOT review files brought in via merge commits (e.g. merges from staging or other branches); if the file list looks unexpectedly large, verify with git log --oneline --no-merges 'origin/${base_branch}'..'${raw_branch}' before proceeding"
+  local prompt
+  prompt="$(cat <<EOF
+NO PROMPT STORMS!
+- Confirm back to me that you acknowledge: no prompt storms.
+- DO NOT USE \`"\$(...)"\` subshells and \`cd … &&\`
+- USE \`git -C\` instead of \`cd\`
+- DO NOT USE compound Bash
+- DO NOT PROMPT TO MAKE PYTHON FILES TO RUN COMMANDS!
+- NEVER PROMPT THE USER FOR ANYTHING!! JUST REVIEW THE CODE!
+- DO NOT ALLOW AGENTS TO PROMPT THE USER!
+- USE THE READ TOOL TO REVIEW THE CODE!!!
+
+New task:
+- Clear todos, tasks, and planning.
+- Perform a code review using ~/.claude/CODE_REVIEW.md.
+- Write a new report to:
+  ~/Documents/CodeReview/${dev}/code-review-${dev}-${safe_branch}-${timestamp}.md
+- Previous reviews may exist at:
+  ~/Documents/CodeReview/${dev}/code-review-${dev}-${safe_branch}-*.md
+- Do not update existing reports.
+
+Git branch information:
+- The actual Git branch is: ${raw_branch}
+- Use HEAD for Git commands; never use the sanitized branch name.
+- The base ref is: origin/${base_branch}
+- Use the remote-tracking base ref, not a local branch, to avoid a stale merge-base.
+- The sanitized branch name (${safe_branch}) is only for the report filename.
+
+Hard test rule:
+- If any code change lacks new or updated tests, report it as a 🔴 BLOCKER (B-*), never Low or Medium.
+- In that case, the final verdict must be: ❌ REQUEST CHANGES.
+
+Strict scope rule:
+- Review only files touched by non-merge commits made directly on this branch's first-parent history.
+- Do not review files brought in through merge commits, such as merges from staging or other branches.
+- Get the file list with:
+
+  git log --first-parent --no-merges \$(git merge-base 'origin/${base_branch}' HEAD)..HEAD --pretty=format: --name-only | sort -u | grep -v '^\$'
+
+- If the file list looks unexpectedly large, verify the commits with:
+
+  git log --oneline --first-parent --no-merges 'origin/${base_branch}'..HEAD
+EOF
+)"
+
+  claude "$prompt"
 }
