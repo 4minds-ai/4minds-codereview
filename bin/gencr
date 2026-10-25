@@ -1,65 +1,7 @@
 #!/usr/bin/env bash
 
-gencr() {
-  if [ -z "$1" ]; then
-    echo "Usage: gencr <dev-username>"
-    return 1
-  fi
-
-  local dev="$1"
-  local raw_branch
-  raw_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" || true
-  local timestamp
-  timestamp=$(date +"%Y%m%d-%H%M%S")
-
-  local input_file="$HOME/.claude/code_review_query.md"
-
-  if [ -z "$raw_branch" ]; then
-    echo "Error: not in a git repo"
-    return 1
-  fi
-
-  if [ ! -f "${input_file}" ]; then
-    echo "Error: ${input_file} not found"
-    return 1
-  fi
-
-  # sanitized name used only for output file path — never pass to git commands
-  local safe_branch="${raw_branch//\//-}"
-  safe_branch="${safe_branch// /-}"
-
-  local base_branch="${CODEREVIEW_BASE_BRANCH:-staging}"
-
-  # escape for sed
-  esc() {
-    printf '%s\n' "$1" | sed 's/[\/&]/\\&/g'
-  }
-
-  local esc_raw_branch
-  esc_raw_branch="$(esc "$raw_branch")"
-  local esc_safe_branch
-  esc_safe_branch="$(esc "$safe_branch")"
-  local esc_base_branch
-  esc_base_branch="$(esc "$base_branch")"
-  local esc_dev
-  esc_dev="$(esc "$dev")"
-  local esc_timestamp
-  esc_timestamp="$(esc "$timestamp")"
-
-  mkdir -p "$HOME/tmp/$dev"
-
-  head -n 1 "${input_file}" | sed \
-    -e "s/{raw-branch}/${esc_raw_branch}/g" \
-    -e "s/{safe-branch}/${esc_safe_branch}/g" \
-    -e "s/{base-branch}/${esc_base_branch}/g" \
-    -e "s/{dev-username}/${esc_dev}/g" \
-    -e "s/{timestamp}/${esc_timestamp}/g"
-}
-
-# ── Review workflows selected by options ──────────────────────────────────────
-# `gencr <dev>` with no options keeps the legacy behavior above (print only).
-# Any option selects the workflows below. They run headless (gencr writes the report
-# package and exits with the outcome code) unless --interactive is given.
+# ── Review workflows ──────────────────────────────────────────────────────────
+# Every run is headless: gencr writes the report package and exits with the outcome code.
 
 # Reconciliation rounds after the initial independent reviews. Enforced by the
 # loop in run_review; reviewers cannot start another round.
@@ -76,8 +18,7 @@ EXIT_PERSISTENCE=23
 usage() {
   cat <<'EOF'
 Usage:
-  gencr <dev-username>                 Print the legacy one-line review prompt (unchanged).
-  gencr <dev-username> [options]       Run a review (headless unless --interactive).
+  gencr <dev-username> [options]       Run a headless review (Claude only unless options say otherwise).
 
 Reviewers:
   --claude=review      Claude reviews (the default reviewer).
@@ -110,7 +51,6 @@ Execution and output:
   --reviewer-timeout=SECONDS
                        Stop a reviewer that runs longer than this (default: no limit).
   --pr-number=N        Pull request number recorded in the review identity.
-  --interactive        Open an interactive single-reviewer session (the gencrnew workflow).
   --print              Print the generated prompt instead of launching anything.
   -h, --help           Show this help.
 
@@ -188,9 +128,9 @@ set_value_option() {
 parse_args() {
   OPT_DEV="" OPT_VERSION="" OPT_VERSION_SET=0 OPT_CLAUDE="" OPT_CLAUDE_SET=0 OPT_CODEX="" OPT_CODEX_SET=0 OPT_PRINT=0
   # shellcheck disable=SC2034  # the model *_SET flags are read through set_value_option
-  OPT_SCOPE="" OPT_INTERACTIVE=0 OPT_CLAUDE_MODEL="" OPT_CLAUDE_MODEL_SET=0 OPT_CODEX_MODEL="" OPT_CODEX_MODEL_SET=0
+  OPT_SCOPE="" OPT_CLAUDE_MODEL="" OPT_CLAUDE_MODEL_SET=0 OPT_CODEX_MODEL="" OPT_CODEX_MODEL_SET=0
   OPT_PREVIOUS="" OPT_PREVIOUS_SET=0 OPT_OUTPUT_DIR="" OPT_OUTPUT_DIR_SET=0 OPT_TIMEOUT="" OPT_TIMEOUT_SET=0
-  OPT_PR="" OPT_PR_SET=0 OPT_SCOPE_EXPLICIT=0 OPT_RANGE="" OPT_RANGE_SET=0 OPT_MERGE_COMMIT="" OPT_MERGE_COMMIT_SET=0
+  OPT_PR="" OPT_PR_SET=0 OPT_RANGE="" OPT_RANGE_SET=0 OPT_MERGE_COMMIT="" OPT_MERGE_COMMIT_SET=0
   local arg
   while [ "$#" -gt 0 ]; do
     arg="$1"
@@ -216,7 +156,7 @@ parse_args() {
         shift ;;
       --fresh|--incremental)
         [ -z "$OPT_SCOPE" ] || die_usage "use only one of --fresh and --incremental"
-        OPT_SCOPE="${arg#--}" OPT_SCOPE_EXPLICIT=1 ;;
+        OPT_SCOPE="${arg#--}" ;;
       --previous=*|--output-dir=*|--previous|--output-dir)
         local flag="${arg%%=*}" value
         if [ "$arg" = "$flag" ]; then
@@ -239,7 +179,6 @@ parse_args() {
         shift ;;
       --reviewer-timeout=*) set_value_option OPT_TIMEOUT --reviewer-timeout "${arg#*=}" ;;
       --pr-number=*) set_value_option OPT_PR --pr-number "${arg#*=}" ;;
-      --interactive) OPT_INTERACTIVE=1 ;;
       --print) OPT_PRINT=1 ;;
       -*) die_usage "unknown option: $arg" ;;
       *)
@@ -312,12 +251,6 @@ resolve_roles() {
     review/review) die_usage "contradictory reviewer assignment: Claude and Codex cannot both be the primary reviewer" ;;
     attack/attack) die_usage "contradictory reviewer assignment: Claude and Codex cannot both be the adversarial reviewer" ;;
   esac
-  if [ "$OPT_INTERACTIVE" -eq 1 ]; then
-    [ -z "$ADVERSARY" ] || die_usage "--interactive supports a single reviewer only"
-    [ "$OPT_SCOPE_EXPLICIT" -eq 0 ] \
-      && [ "$OPT_PREVIOUS_SET$OPT_OUTPUT_DIR_SET$OPT_TIMEOUT_SET$OPT_PR_SET$OPT_RANGE_SET$OPT_MERGE_COMMIT_SET" = 000000 ] \
-      || die_usage "--interactive cannot be combined with --fresh, --incremental, --previous, --output-dir, --reviewer-timeout, --pr-number, --range or --merge-commit"
-  fi
 }
 
 # Sets INSTRUCTIONS_FILE and INSTRUCTIONS_LABEL. Never substitutes another version.
@@ -604,20 +537,6 @@ NO PROMPT STORMS!
 EOF
 }
 
-prompt_single_task() {
-  cat <<EOF
-New task:
-- Clear todos, tasks, and planning.
-- Perform a code review using \`${INSTRUCTIONS_FILE}\`.
-- These are the selected review instructions (${INSTRUCTIONS_LABEL}). Use this file only; do not substitute another version.
-- Write a new report to:
-  ~/Documents/CodeReview/${OPT_DEV}/code-review-${OPT_DEV}-${SAFE_BRANCH}-${TIMESTAMP}.md
-- Previous reviews may exist at:
-  ~/Documents/CodeReview/${OPT_DEV}/code-review-${OPT_DEV}-${SAFE_BRANCH}-*.md
-- Do not update existing reports.
-EOF
-}
-
 prompt_git_info() {
   cat <<EOF
 Git branch information:
@@ -637,21 +556,6 @@ Hard test rule:
 EOF
 }
 
-prompt_strict_scope() {
-  cat <<EOF
-Strict scope rule:
-- Review only files touched by non-merge commits made directly on this branch's first-parent history.
-- Do not review files brought in through merge commits, such as merges from staging or other branches.
-- Get the file list with:
-
-  git log --first-parent --no-merges \$(git merge-base 'origin/${BASE_BRANCH}' HEAD)..HEAD --pretty=format: --name-only | sort -u | grep -v '^\$'
-
-- If the file list looks unexpectedly large, verify the commits with:
-
-  git log --oneline --first-parent --no-merges 'origin/${BASE_BRANCH}'..HEAD
-EOF
-}
-
 prompt_output_rule() {
   cat <<EOF
 Output format rule:
@@ -664,25 +568,6 @@ Output format rule:
     - Fix: ...
 - Use the same bullet format for comparisons such as prior findings vs. how they were fixed.
 EOF
-}
-
-prompt_git_and_rules() {
-  prompt_git_info
-  echo
-  prompt_test_rule
-  echo
-  prompt_strict_scope
-  echo
-  prompt_output_rule
-}
-
-# The interactive (gencrnew) prompt: unchanged from phase 1.
-build_single_prompt() {
-  prompt_preamble
-  echo
-  prompt_single_task
-  echo
-  prompt_git_and_rules
 }
 
 prompt_scope_contract() {
@@ -1473,20 +1358,6 @@ print_review_comment() {
   echo "Review package: ${RUN_DIR}"
 }
 
-run_interactive() {
-  local prompt args=()
-  prompt="$(build_single_prompt)"
-  mkdir -p "$REPORT_DIR"
-  case "$PRIMARY" in
-    claude)
-      [ -z "$OPT_CLAUDE_MODEL" ] || args=(--model "$OPT_CLAUDE_MODEL")
-      claude "${args[@]}" "$prompt" ;;
-    codex)
-      [ -z "$OPT_CODEX_MODEL" ] || args=(--model "$OPT_CODEX_MODEL")
-      codex "${args[@]}" --add-dir "$REPORT_DIR" "$prompt" ;;
-  esac
-}
-
 cleanup() {
   [ -z "${WORK_DIR:-}" ] || rm -rf "$WORK_DIR"
 }
@@ -1496,10 +1367,6 @@ review_main() {
   resolve_roles
   resolve_instructions
   load_git_context
-  if [ "$OPT_INTERACTIVE" -eq 1 ]; then
-    if [ "$OPT_PRINT" -eq 1 ]; then build_single_prompt; else run_interactive; fi
-    return
-  fi
   WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/gencr.XXXXXX")" || die "cannot create a temporary directory"
   trap cleanup EXIT
   load_review_identity
@@ -1513,13 +1380,7 @@ review_main() {
 }
 
 main() {
-  local arg
-  for arg in "$@"; do
-    case "$arg" in
-      -*) review_main "$@"; return ;;
-    esac
-  done
-  gencr "$@"
+  review_main "$@"
 }
 
 main "$@"

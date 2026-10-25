@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Behavior tests for bin/gencr and gencrnew (macOS bash 3.2 and Linux bash 5). Runs entirely in a
+# Behavior tests for bin/gencr (macOS bash 3.2 and Linux bash 5). Runs entirely in a
 # temporary HOME with mock claude/codex CLIs that record the argv, cwd, environment and stdin
 # each invocation receives. No real reviewer, network or GitHub access.
 # Usage: bash tests/test_gencr.sh
@@ -26,14 +26,11 @@ json_get() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); exec("
 TREE="$WORK/code review"
 mkdir -p "$TREE"
 cp -R "$REPO/bin" "$REPO/dotfiles" "$TREE/"
-# The pre-modernization bin/gencr (main at 2b045f7), pinned so the legacy comparisons keep testing the original.
-cp "$REPO/tests/fixtures/gencr.legacy" "$WORK/gencr.HEAD"
 INSTR_SUMS_BEFORE="$(cd "$REPO/dotfiles/claude" && sha1 ./*.md)"
 
 export HOME="$WORK/home dir"
 mkdir -p "$HOME/bin" "$HOME/.claude"
 ln -s "$TREE/bin/gencr" "$HOME/bin/gencr"
-ln -s "$TREE/dotfiles/claude/code_review_query.md" "$HOME/.claude/code_review_query.md"
 GENCR="$HOME/bin/gencr"
 
 MOCK_BIN="$WORK/mock bin"
@@ -144,20 +141,39 @@ verify() {
   } > "$file.new" && mv "$file.new" "$file"
 }
 
-# ── 1. Backward compatibility ──────────────────────────────────────────────────
+# ── 1. The gencr command: a headless review by the new engine, Claude only by default ──
 
 reset_mocks
-expected="$(cd "$TARGET" && bash "$WORK/gencr.HEAD" legacy 2>&1; echo "status=$?")"
-actual="$(cd "$TARGET" && "$GENCR" legacy 2>&1; echo "status=$?")"
-check "legacy 'gencr <dev>' output is byte-identical to the committed gencr" [ "$expected" = "$actual" ]
-check "legacy output still uses the legacy template" contains "$actual" "new task: clear todos/tasks/planning"
-expected="$(cd "$TARGET" && bash "$WORK/gencr.HEAD" 2>&1; echo "status=$?")"
-actual="$(cd "$TARGET" && "$GENCR" 2>&1; echo "status=$?")"
-check "legacy no-argument usage is unchanged" [ "$expected" = "$actual" ]
-expected="$(cd "$NOT_GIT" && bash "$WORK/gencr.HEAD" someone 2>&1; echo "status=$?")"
-actual="$(cd "$NOT_GIT" && "$GENCR" someone 2>&1; echo "status=$?")"
-check "legacy not-in-git-repo error is unchanged" [ "$expected" = "$actual" ]
-check "legacy mode launches no reviewer" [ "$(calls)" -eq 0 ]
+queue_single 1 claude APPROVED
+run_gencr plain
+check "'gencr <dev>' runs one headless Claude review (no Codex) and exits 0 on APPROVED" \
+  eval '[ "$STATUS" -eq 0 ] && [ "$(calls)" -eq 1 ] && [ "$(cat "$MOCK_STATE/call-1.agent")" = claude ] && grep -qx -- -p "$MOCK_STATE/call-1.args" && [ ! -e "$MOCK_STATE/call-2.agent" ]'
+check "'gencr <dev>' writes the new-engine package and prints the GitHub review comment" \
+  eval '[ -f "$(pkg plain)/manifest.json" ] && [ "$(json_get "$(pkg plain)/metadata.json" "d[\"primary\"], d[\"adversary\"]")" = "claude None" ] &&
+        contains "$OUT" "========== GITHUB REVIEW COMMENT ==========" && ! contains "$OUT$ERR" "new task: clear todos"'
+check "'gencr <dev>' uses the structured report contract (the prompt requires Review notes)" \
+  file_contains "$MOCK_STATE/call-1.stdin" '"## Review notes": the last section'
+reset_mocks
+queue_single 1 claude "REQUEST CHANGES"
+run_gencr plain
+check "'gencr <dev>' exits 10 on REQUEST CHANGES (a completed review)" eval '[ "$STATUS" -eq 10 ] && [ "$(calls)" -eq 1 ]'
+reset_mocks
+queue_single 1 claude APPROVED
+edit_in_place "$MOCK_STATE/responses/1" '/^## Review notes/,/^- Other observations/d'
+run_gencr plain
+check "'gencr <dev>' exits 20 INCOMPLETE on an invalid report" eval '[ "$STATUS" -eq 20 ] && [ "$(json_get "$(pkg plain)/metadata.json" "d[\"outcome\"]")" = INCOMPLETE ]'
+reset_mocks
+actual="$(cd "$TARGET" && "$GENCR" 2>&1)"; status=$?
+check "'gencr' without a dev-username is a usage error (exit 2), not the old prompt" \
+  eval '[ "$status" -eq 2 ] && contains "$actual" "missing <dev-username>" && [ "$(calls)" -eq 0 ]'
+actual="$(cd "$NOT_GIT" && "$GENCR" someone 2>&1)"; status=$?
+check "'gencr <dev>' outside a git repository fails before any reviewer" eval '[ "$status" -ne 0 ] && [ "$(calls)" -eq 0 ]'
+if command -v zsh >/dev/null 2>&1; then
+  check "gencrnew is no longer defined by dotfiles/zsh/codereview.zsh" \
+    eval '! zsh -fc '"'"'source "$1"; whence -w gencrnew'"'"' zsh "$REPO/dotfiles/zsh/codereview.zsh" >/dev/null 2>&1'
+else
+  not_ok "zsh is required for the shell-function checks"
+fi
 
 # ── 2. Argument parsing and version resolution ─────────────────────────────────
 
@@ -221,47 +237,13 @@ bad_args "repeated --claude-model" dev1 --claude-model=opus --claude-model opus
 bad_args "repeated --codex-model" dev1 --codex-model=a --codex-model=b
 bad_args "zero --reviewer-timeout" dev1 --reviewer-timeout=0
 bad_args "non-numeric --pr-number" dev1 --pr-number=12a
-bad_args "--interactive with an adversary" dev1 --interactive --codex=attack
-bad_args "--interactive with --incremental" dev1 --interactive --incremental
-bad_args "--interactive with --fresh" dev1 --interactive --fresh
-bad_args "--interactive with --output-dir" dev1 --interactive --output-dir=/tmp/x
+bad_args "the removed --interactive option" dev1 --interactive
 run_gencr dev1 --codex=bogus
 check "invalid reviewer mode names the bad value" contains "$ERR" "unsupported reviewer mode 'bogus'"
 run_gencr dev1 --codex=attack --claude=attack
 check "contradictory assignment is explained" contains "$ERR" "contradictory reviewer assignment"
 
-# ── 3. Interactive sessions (gencrnew) and headless single reviews ─────────────
-
-reset_mocks
-run_gencr single --version=2 --interactive
-prompt="$(cat "$MOCK_STATE/call-1.prompt" 2>/dev/null)"
-check "--interactive launches Claude once, interactively" eval '[ "$(calls)" -eq 1 ] && [ "$(cat "$MOCK_STATE/call-1.agent")" = claude ] && ! grep -qx -- -p "$MOCK_STATE/call-1.args"'
-check "the interactive prompt names the version 2 file" contains "$prompt" "CODE_REVIEW_VERSION_2.md"
-check "the interactive prompt keeps the Operator's output format rule" contains "$prompt" "DO NOT USE MARKDOWN TABLES or box-drawing tables anywhere"
-reset_mocks
-run_gencr single --interactive --claude-model=opus
-check "--interactive passes --claude-model to the session" [ "$(arg_after 1 --model)" = opus ]
-reset_mocks
-run_gencr single2 --codex=review --interactive
-check "--codex=review --interactive launches Codex interactively, writing only its report directory" \
-  eval '[ "$(cat "$MOCK_STATE/call-1.agent")" = codex ] && grep -qxF -- "$HOME/Documents/CodeReview/single2" "$MOCK_STATE/call-1.args"'
-
-if command -v zsh >/dev/null 2>&1; then
-  # Previous gencrnew (with the Operator's uncommitted rule) vs. the new wrapper.
-  reset_mocks
-  ( cd "$TARGET" && zsh -fc 'source "$1"; gencrnew legacydev' zsh "$REPO/tests/fixtures/gencrnew.previous.zsh" ) >/dev/null 2>&1
-  cp "$MOCK_STATE/call-1.prompt" "$WORK/old.prompt"
-  reset_mocks
-  ( cd "$TARGET" && zsh -fc 'source "$1"; gencrnew legacydev' zsh "$TREE/dotfiles/zsh/codereview.zsh" ) >/dev/null 2>&1
-  cp "$MOCK_STATE/call-1.prompt" "$WORK/new.prompt" 2>/dev/null
-  check "gencrnew still launches an interactive Claude session through bin/gencr" \
-    eval '[ "$(calls)" -eq 1 ] && ! grep -qx -- -p "$MOCK_STATE/call-1.args"'
-  removed="$(diff "$WORK/old.prompt" "$WORK/new.prompt" | grep '^<')"
-  check "gencrnew prompt is unchanged except the selected-instructions lines" \
-    [ "$removed" = "< - Perform a code review using ~/.claude/CODE_REVIEW.md." ]
-else
-  not_ok "zsh is required for the gencrnew tests"
-fi
+# ── 3. Headless single reviews ─────────────────────────────────────────────────
 
 reset_mocks
 queue_single 1 claude APPROVED

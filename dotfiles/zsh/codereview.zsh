@@ -1,13 +1,4 @@
 
-# bin/gencr in this repository, resolved when this file is sourced.
-_codereview_gencr="${${(%):-%x}:A:h:h:h}/bin/gencr"
-
-# Launches an interactive Claude session with the generated review prompt. The prompt,
-# including the output format rule, is built by bin/gencr; extra gencr options pass through.
-gencrnew() {
-  "$_codereview_gencr" --claude=review --interactive "$@"
-}
-
 gencrclaude() {
   if [ -z "$1" ]; then
     echo "Usage: gencrclaude <dev-username>"

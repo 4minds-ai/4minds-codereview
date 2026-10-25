@@ -329,8 +329,6 @@ run_in "$R" --print --incremental --range="$BASE0..$HEAD0"
 check "--range with --incremental is a usage error" eval '[ "$STATUS" -eq 2 ]'
 run_in "$R" --print --incremental --merge-commit="$HEAD0"
 check "--merge-commit with --incremental is a usage error" eval '[ "$STATUS" -eq 2 ]'
-run_in "$R" --interactive --range="$BASE0..$HEAD0"
-check "--range with --interactive is a usage error" eval '[ "$STATUS" -eq 2 ]'
 
 # ── Incremental anchors ────────────────────────────────────────────────────────
 
