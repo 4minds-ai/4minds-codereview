@@ -50,8 +50,6 @@ NO PROMPT STORMS!
 - NEVER PROMPT THE USER FOR ANYTHING!! JUST REVIEW THE CODE!
 - DO NOT ALLOW AGENTS TO PROMPT THE USER!
 - USE THE READ TOOL TO REVIEW THE CODE!!!
-# bin/gencr in this repository, resolved when this file is sourced.
-_codereview_gencr="${${(%):-%x}:A:h:h:h}/bin/gencr"
 
 New task:
 - Clear todos, tasks, and planning.
