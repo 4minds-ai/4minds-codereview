@@ -1,7 +1,16 @@
 
+# bin/gencr in this repository, resolved when this file is sourced.
+_codereview_gencr="${${(%):-%x}:A:h:h:h}/bin/gencr"
+
+# Launches an interactive Claude session with the generated review prompt. The prompt,
+# including the output format rule, is built by bin/gencr; extra gencr options pass through.
 gencrnew() {
+  "$_codereview_gencr" --claude=review --interactive "$@"
+}
+
+gencrclaude() {
   if [ -z "$1" ]; then
-    echo "Usage: gencrnew <dev-username>"
+    echo "Usage: gencrclaude <dev-username>"
     return 1
   fi
 
@@ -41,6 +50,8 @@ NO PROMPT STORMS!
 - NEVER PROMPT THE USER FOR ANYTHING!! JUST REVIEW THE CODE!
 - DO NOT ALLOW AGENTS TO PROMPT THE USER!
 - USE THE READ TOOL TO REVIEW THE CODE!!!
+# bin/gencr in this repository, resolved when this file is sourced.
+_codereview_gencr="${${(%):-%x}:A:h:h:h}/bin/gencr"
 
 New task:
 - Clear todos, tasks, and planning.
