@@ -1,0 +1,63 @@
+# Free, secret-free tests of gencr on Ubuntu and macOS. Uses mock reviewer CLIs only; never runs a
+# paid review and never needs a credential.
+
+name: gencr tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install test tools
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then sudo apt-get update -qq && sudo apt-get install -y -qq zsh shellcheck
+          else brew install shellcheck; fi
+
+      - name: Configure Git for test fixtures
+        run: |
+          git config --global user.email ci@example.com
+          git config --global user.name CI
+
+      - name: gencr engine tests
+        run: bash tests/test_gencr.sh
+
+      - name: gencr-ci (GitHub publishing) tests
+        run: bash tests/test_gencr_ci.sh
+
+      - name: Incremental duplication check tests
+        run: bash tests/test_gencr_dup.sh
+
+      - name: Review scope resolution tests
+        run: bash tests/test_gencr_scope.sh
+
+      - name: Report grammar and format normalization tests
+        run: bash tests/test_gencr_format.sh
+
+      - name: GitHub-ready review comment tests
+        run: bash tests/test_gencr_summary.sh
+
+      - name: Peer-finding ownership tests
+        run: bash tests/test_gencr_peer.sh
+
+      - name: Review notes tests
+        run: bash tests/test_gencr_notes.sh
+
+      - name: Field value tests
+        run: bash tests/test_gencr_values.sh

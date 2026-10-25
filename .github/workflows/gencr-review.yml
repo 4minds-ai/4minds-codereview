@@ -1,0 +1,267 @@
+# Manually triggered gencr review of a pull request in this repository.
+#
+# Paid reviews are DISABLED: the only reviewer backend is "mock", which runs the deterministic mock
+# CLIs in tests/mocks. No provider credential is referenced anywhere in this workflow. Enabling real
+# Claude/Codex reviews requires a DevOps-provisioned organization-owned CI identity, a verified
+# credential-isolation design, and a reviewed change to this file (see README, "GitHub Actions").
+#
+# Trust boundaries: tooling always comes from this workflow's own commit on the default branch, never
+# from the pull request; the PR checkout is data only (no credentials persisted, nothing executed).
+# The review job has read-only permissions; only the publish job can comment and set the status, and
+# it never checks out PR code. Inputs are passed through environment variables, never into scripts.
+
+name: gencr review (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number in this repository
+        required: true
+        type: string
+      version:
+        description: Review instruction version N (CODE_REVIEW_VERSION_N.md); blank for CODE_REVIEW.md
+        required: false
+        type: string
+        default: ""
+      scope:
+        description: Review scope
+        type: choice
+        options: [fresh, incremental]
+        default: fresh
+      primary:
+        description: Primary reviewer
+        type: choice
+        options: [claude, codex]
+        default: claude
+      adversary:
+        description: Adversarial reviewer (none for a single-reviewer review)
+        type: choice
+        options: [codex, claude, none]
+        default: codex
+      claude_model:
+        description: Claude model override (blank for the configured default)
+        required: false
+        type: string
+        default: ""
+      codex_model:
+        description: Codex model override (blank for the configured default)
+        required: false
+        type: string
+        default: ""
+      reviewer_backend:
+        description: Reviewer CLIs (paid reviews are disabled; only mock is available)
+        type: choice
+        options: [mock]
+        default: mock
+      retention_days:
+        description: Artifact retention in days (1-90)
+        type: string
+        default: "30"
+      reviewer_timeout_minutes:
+        description: Per-reviewer timeout in minutes (1-180)
+        type: string
+        default: "20"
+
+permissions: {}
+
+jobs:
+  trust:
+    # Runs before any repository code: only the protected default branch may run this workflow,
+    # and only with the mock backend. Every other job depends on this one.
+    name: Trusted ref and backend
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    env:
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      BACKEND: ${{ inputs.reviewer_backend }}
+    steps:
+      - name: Require the default branch and the mock backend
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
+            echo "::error::gencr review must be dispatched from the default branch ($DEFAULT_BRANCH), not $GITHUB_REF"
+            exit 1
+          fi
+          if [ "$BACKEND" != mock ]; then
+            echo "::error::paid reviews are disabled; only the mock reviewer backend is available"
+            exit 1
+          fi
+
+  review:
+    name: Review (read-only)
+    needs: trust
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    concurrency:
+      group: gencr-review-${{ github.repository }}-${{ inputs.pr_number }}
+      cancel-in-progress: false
+    outputs:
+      reviewed_sha: ${{ steps.context.outputs.head_sha }}
+      exit_code: ${{ steps.run.outputs.exit_code }}
+      artifact_url: ${{ steps.upload.outputs.artifact-url }}
+    env:
+      PR_NUMBER: ${{ inputs.pr_number }}
+      VERSION: ${{ inputs.version }}
+      SCOPE: ${{ inputs.scope }}
+      PRIMARY: ${{ inputs.primary }}
+      ADVERSARY: ${{ inputs.adversary }}
+      CLAUDE_MODEL: ${{ inputs.claude_model }}
+      CODEX_MODEL: ${{ inputs.codex_model }}
+      BACKEND: ${{ inputs.reviewer_backend }}
+      RETENTION_DAYS: ${{ inputs.retention_days }}
+      TIMEOUT_MINUTES: ${{ inputs.reviewer_timeout_minutes }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - name: Check out trusted tooling (this workflow's commit)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: tools
+          persist-credentials: false
+
+      - name: Validate inputs, trusted ref and reviewer backend
+        run: >
+          python3 tools/bin/gencr-ci gate --ref "$GITHUB_REF" --default-branch "$DEFAULT_BRANCH"
+          --backend "$BACKEND" --pr-number "$PR_NUMBER" --version "$VERSION" --scope "$SCOPE"
+          --primary "$PRIMARY" --adversary "$ADVERSARY" --claude-model "$CLAUDE_MODEL"
+          --codex-model "$CODEX_MODEL" --retention-days "$RETENTION_DAYS" --timeout-minutes "$TIMEOUT_MINUTES"
+
+      - name: Resolve the pull request
+        id: context
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/bin/gencr-ci context --repo "$GITHUB_REPOSITORY" --pr-number "$PR_NUMBER"
+
+      - name: Check out the pull request head (data only)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.context.outputs.head_sha }}
+          path: target
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: false
+          lfs: false
+
+      - name: Verify the reviewed commit and base
+        env:
+          HEAD_SHA: ${{ steps.context.outputs.head_sha }}
+          BASE_REF: ${{ steps.context.outputs.base_ref }}
+        run: |
+          test "$(git -C target rev-parse HEAD)" = "$HEAD_SHA"
+          git -C target rev-parse --verify --quiet "refs/remotes/origin/$BASE_REF^{commit}" >/dev/null
+
+      - name: Resolve the review scope of a merged pull request (fresh)
+        id: scope
+        if: inputs.scope == 'fresh'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ steps.context.outputs.head_sha }}
+        run: python3 tools/bin/gencr-ci historical-scope --repo "$GITHUB_REPOSITORY" --pr-number "$PR_NUMBER" --expected-sha "$HEAD_SHA" --target target
+
+      - name: Use the mock reviewer CLIs
+        run: echo "$GITHUB_WORKSPACE/tools/tests/mocks" >> "$GITHUB_PATH"
+
+      - name: Fetch the previous review (incremental)
+        if: inputs.scope == 'incremental'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/bin/gencr-ci find-previous --repo "$GITHUB_REPOSITORY" --pr-number "$PR_NUMBER" --backend "$BACKEND" --out "$RUNNER_TEMP/previous"
+
+      - name: Run gencr (headless, read-only reviewers)
+        id: run
+        working-directory: target
+        env:
+          CODEREVIEW_BASE_BRANCH: ${{ steps.context.outputs.base_ref }}
+          SCOPE_ARG: ${{ steps.scope.outputs.scope_arg }}
+          GENCR_REVIEW_COMMENT: "off"
+          HOME: ${{ runner.temp }}/home
+        run: |
+          mkdir -p "$HOME"
+          args=(--"$SCOPE" --pr-number="$PR_NUMBER" --output-dir="$RUNNER_TEMP/gencr-out"
+                --reviewer-timeout="$((TIMEOUT_MINUTES * 60))")
+          [ -z "$VERSION" ] || args+=(--version="$VERSION")
+          [ "$SCOPE" != incremental ] || args+=(--previous="$RUNNER_TEMP/previous")
+          [ -z "${SCOPE_ARG:-}" ] || args+=("$SCOPE_ARG")
+          [ -z "$CLAUDE_MODEL" ] || args+=(--claude-model="$CLAUDE_MODEL")
+          [ -z "$CODEX_MODEL" ] || args+=(--codex-model="$CODEX_MODEL")
+          if [ "$ADVERSARY" = none ]; then args+=("--$PRIMARY=review")
+          elif [ "$PRIMARY" = claude ]; then args+=(--codex=attack)
+          else args+=(--codex=review --claude=attack); fi
+          status=0
+          "$GITHUB_WORKSPACE/tools/bin/gencr" "pr-$PR_NUMBER" "${args[@]}" || status=$?
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+          echo "gencr exit status: $status"
+
+      - name: Package the review artifact
+        if: always()
+        run: python3 tools/bin/gencr-ci package --output-dir "$RUNNER_TEMP/gencr-out" --pr-number "$PR_NUMBER" --backend "$BACKEND" --out "$RUNNER_TEMP/artifact"
+
+      - name: Upload the review artifact
+        id: upload
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: code-review-pr-${{ inputs.pr_number }}
+          path: ${{ runner.temp }}/artifact
+          retention-days: ${{ inputs.retention_days }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish PR summary and status
+    needs: [trust, review]
+    # Runs for every outcome of a trusted run (including review failures), never for an untrusted ref.
+    if: always() && needs.trust.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+      statuses: write
+      actions: read
+    concurrency:
+      group: gencr-publish-${{ github.repository }}-${{ inputs.pr_number }}
+      cancel-in-progress: false
+    env:
+      PR_NUMBER: ${{ inputs.pr_number }}
+      RETENTION_DAYS: ${{ inputs.retention_days }}
+      REVIEWED_SHA: ${{ needs.review.outputs.reviewed_sha }}
+      ARTIFACT_URL: ${{ needs.review.outputs.artifact_url }}
+      REVIEW_RESULT: ${{ needs.review.result }}
+      BACKEND: ${{ inputs.reviewer_backend }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Check out trusted tooling (this workflow's commit)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: tools
+          persist-credentials: false
+
+      - name: Download the review artifact
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: code-review-pr-${{ inputs.pr_number }}
+          path: ${{ runner.temp }}/package
+
+      - name: Publish the PR comment and commit status
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          python3 tools/bin/gencr-ci publish --repo "$GITHUB_REPOSITORY" --pr-number "$PR_NUMBER"
+          --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --package "$RUNNER_TEMP/package"
+          --run-url "$RUN_URL" --artifact-url "$ARTIFACT_URL" --retention-days "$RETENTION_DAYS"
+          --reviewed-sha "$REVIEWED_SHA" --review-result "$REVIEW_RESULT" --backend "$BACKEND"
+
+      - name: Report the review outcome
+        env:
+          OUTCOME: ${{ steps.publish.outputs.outcome }}
+        run: |
+          echo "gencr outcome: ${OUTCOME:-unknown}"
+          test "$OUTCOME" = APPROVED

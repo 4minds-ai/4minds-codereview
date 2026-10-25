@@ -1,0 +1,493 @@
+#!/usr/bin/env python3
+"""GitHub Actions adapter for gencr: input gate, PR context, artifact packaging and PR publishing.
+
+Used only by .github/workflows/gencr-review.yml. The review engine (bin/gencr) never imports or
+calls this file. All GitHub access goes through the `gh` CLI with the job's GH_TOKEN; destinations
+come from validated workflow inputs and the GitHub API, never from review text or artifacts.
+Standard library only (Python 3.8+).
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+sys.dont_write_bytecode = True  # never leave __pycache__ in the tooling checkout
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import gencr_support  # noqa: E402  (header renderer shared with local reports)
+
+WORKFLOW_PATH = ".github/workflows/gencr-review.yml"
+MARKER = "<!-- gencr-review:v1 "
+BOT_LOGIN = "github-actions[bot]"
+STATUS_CONTEXT = "gencr/review"
+# Mock-backend runs test the pipeline only; they never use the real review status context.
+MOCK_STATUS_CONTEXT = "gencr/review-mock"
+BACKEND_FILE = "ci-backend.json"
+COMMENT_LIMIT = 60000
+REVIEW_OUTCOMES = ("APPROVED", "REQUEST CHANGES", "UNRESOLVED DISAGREEMENT")
+PACKAGE_FILES = gencr_support.PACKAGE_FILES + ("manifest.json",)
+ARTIFACT_FILES = PACKAGE_FILES + (BACKEND_FILE,)
+TRANSCRIPT_RE = re.compile(r"^(00-shared-prompt\.md|\d\d-round\d-(claude|codex)-[a-z]+\."
+                           r"(prompt\.md|report\.md|report\.original\.md|normalization\.json|invoke\.json))$")
+REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+REF_RE = re.compile(r"^[A-Za-z0-9._/-]{1,200}$")
+MODEL_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199})?$")
+
+
+def die(message, code=1):
+    sys.stderr.write("gencr-ci: error: %s\n" % message)
+    sys.exit(code)
+
+
+def gh(*args, body=None):
+    """Runs `gh api ...` and returns parsed JSON (None for empty output)."""
+    argv = ["gh", "api"] + list(args)
+    if body is not None:
+        argv += ["--input", "-"]
+    proc = subprocess.run(argv, input=json.dumps(body).encode() if body is not None else None,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        raise RuntimeError("gh api %s failed: %s" % (args[-1] if args else "", proc.stderr.decode()[:300].strip()))
+    text = proc.stdout.decode().strip()
+    return json.loads(text) if text else None
+
+
+def write_outputs(values):
+    """Appends validated single-line key=value pairs to $GITHUB_OUTPUT (or prints them)."""
+    lines = []
+    for key, value in values.items():
+        value = str(value)
+        if "\n" in value or "\r" in value:
+            die("refusing a multi-line output value for %s" % key)
+        lines.append("%s=%s\n" % (key, value))
+    target = os.environ.get("GITHUB_OUTPUT")
+    if target:
+        with open(target, "a", encoding="utf-8") as handle:
+            handle.writelines(lines)
+    else:
+        sys.stdout.writelines(lines)
+
+
+# ── gate: inputs and trusted tooling ──────────────────────────────────────────
+
+def cmd_gate(args):
+    errors = []
+    if args.ref != "refs/heads/" + args.default_branch:
+        errors.append("the workflow must run from the protected default branch %s (got %s)"
+                      % (args.default_branch, args.ref))
+    if args.backend != "mock":
+        errors.append("paid reviews are disabled: only the mock reviewer backend is available until DevOps "
+                      "provisions an organization-owned CI identity and the credential isolation test passes")
+    if not re.match(r"^[1-9][0-9]{0,9}$", args.pr_number):
+        errors.append("pr_number must be a positive whole number")
+    if args.version and not re.match(r"^[1-9][0-9]{0,3}$", args.version):
+        errors.append("version must be blank or a positive whole number")
+    if args.scope not in ("fresh", "incremental"):
+        errors.append("scope must be fresh or incremental")
+    if args.primary not in ("claude", "codex") or args.adversary not in ("claude", "codex", "none"):
+        errors.append("primary must be claude or codex; adversary claude, codex or none")
+    elif args.primary == args.adversary:
+        errors.append("primary and adversary must be different reviewers")
+    for name in ("claude_model", "codex_model"):
+        if not MODEL_RE.match(getattr(args, name)):
+            errors.append("%s is not a valid model identifier" % name)
+    if not re.match(r"^([1-9]|[1-8][0-9]|90)$", args.retention_days):
+        errors.append("retention_days must be between 1 and 90")
+    if not re.match(r"^([1-9]|[1-9][0-9]|1[0-7][0-9]|180)$", args.timeout_minutes):
+        errors.append("reviewer_timeout_minutes must be between 1 and 180")
+    if errors:
+        die("; ".join(errors))
+    return 0
+
+
+# ── context: the pull request under review ────────────────────────────────────
+
+def pr_context(repo, number):
+    if not REPO_RE.match(repo or "") or not re.match(r"^[1-9][0-9]*$", str(number)):
+        raise RuntimeError("invalid repository or pull request number")
+    pr = gh("repos/%s/pulls/%s" % (repo, number))
+    if not isinstance(pr, dict) or pr.get("number") != int(number):
+        raise RuntimeError("pull request %s not found in %s" % (number, repo))
+    base_repo = (pr.get("base") or {}).get("repo") or {}
+    head = pr.get("head") or {}
+    context = {
+        "state": pr.get("state"), "merged": pr.get("merged") is True, "merge_commit_sha": pr.get("merge_commit_sha"),
+        "commits": pr.get("commits"), "base_ref": (pr.get("base") or {}).get("ref"), "head_sha": head.get("sha"),
+        "head_repo": (head.get("repo") or {}).get("full_name") or "", "base_repo": base_repo.get("full_name"),
+    }
+    if context["base_repo"] != repo:
+        raise RuntimeError("pull request %s does not target %s" % (number, repo))
+    if not SHA_RE.match(context["head_sha"] or "") or not REF_RE.match(context["base_ref"] or ""):
+        raise RuntimeError("pull request %s has an unexpected head SHA or base ref" % number)
+    context["fork"] = "true" if context["head_repo"] != repo else "false"
+    return context
+
+
+def cmd_context(args):
+    try:
+        context = pr_context(args.repo, args.pr_number)
+    except RuntimeError as error:
+        die(str(error))
+    if context["state"] != "open" and not context["merged"]:
+        die("pull request %s is %s without being merged; only open or merged pull requests are reviewed"
+            % (args.pr_number, context["state"]))
+    if args.expected_sha and args.expected_sha != context["head_sha"]:
+        die("pull request head is %s, not the expected %s" % (context["head_sha"], args.expected_sha))
+    write_outputs({"head_sha": context["head_sha"], "base_ref": context["base_ref"], "fork": context["fork"]})
+    return 0
+
+
+# ── historical-scope: the original change set of a merged pull request ────────
+
+def git(target, *args):
+    proc = subprocess.run(["git", "-C", target] + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return proc.returncode, proc.stdout.decode().strip()
+
+
+def merged_scope(context, repo, number, target):
+    """--merge-commit for a regular merge, else --range from the complete recorded commit list. Never guesses."""
+    head, merge = context["head_sha"], context["merge_commit_sha"] or ""
+    if SHA_RE.match(merge):
+        status, parents = git(target, "rev-list", "--parents", "-n", "1", merge)
+        if status == 0 and len(parents.split()) == 3 and parents.split()[2] == head:
+            return "--merge-commit=" + merge
+    count = context["commits"]
+    if type(count) is not int or count < 1:  # a JSON true is a Python int, but never a commit count
+        raise RuntimeError("the pull request does not report its commit count")
+    try:
+        pages = gh("--paginate", "--slurp", "repos/%s/pulls/%s/commits?per_page=100" % (repo, number)) or []
+    except RuntimeError as error:
+        raise RuntimeError("cannot read the complete commit list (%s)" % error)
+    listed = [c for page in pages for c in (page if isinstance(page, list) else [page])]
+    shas = [c.get("sha") for c in listed]
+    if not all(SHA_RE.match(sha or "") for sha in shas):
+        raise RuntimeError("the commit list contains an invalid SHA")
+    if len(set(shas)) != len(shas):
+        raise RuntimeError("the commit list contains duplicate commits")
+    if len(shas) != count:  # also catches GitHub's 250-commit list limit
+        raise RuntimeError("the commit list lists %d of the %d commits the pull request reports" % (len(shas), count))
+    if head not in shas:
+        raise RuntimeError("the commit list does not include the pull request head %s" % head)
+    outside = {p.get("sha") for c in listed for p in (c.get("parents") or []) if p.get("sha") not in shas}
+    if len(outside) != 1:
+        raise RuntimeError("the listed commits have %s parent outside the pull request, so it has no single "
+                           "original base" % ("no" if not outside else "more than one"))
+    base = outside.pop()
+    if not SHA_RE.match(base or ""):
+        raise RuntimeError("the commit list has an invalid parent SHA")
+    status, local = git(target, "rev-list", "%s..%s" % (base, head))
+    if status != 0 or set(local.split()) != set(shas) or len(local.split()) != len(shas):
+        raise RuntimeError("the recorded commit list does not match the local history %s..%s" % (base[:12], head[:12]))
+    return "--range=%s..%s" % (base, head)
+
+
+def cmd_historical_scope(args):
+    """Runs after the head checkout; writes scope_arg (empty for an open pull request)."""
+    try:
+        context = pr_context(args.repo, args.pr_number)
+        if context["head_sha"] != args.expected_sha:
+            raise RuntimeError("pull request head is %s, not the expected %s" % (context["head_sha"], args.expected_sha))
+        status, checked_out = git(args.target, "rev-parse", "HEAD")
+        if status != 0 or checked_out != args.expected_sha:
+            raise RuntimeError("the checked-out commit is %s, not the pull request head %s" % (checked_out, args.expected_sha))
+        if context["state"] == "open":
+            scope_arg = ""
+        elif context["merged"]:
+            scope_arg = merged_scope(context, args.repo, args.pr_number, args.target)
+        else:
+            raise RuntimeError("pull request %s is closed without being merged" % args.pr_number)
+    except RuntimeError as error:
+        die("cannot establish the review scope of merged pull request %s: %s. Review it locally with "
+            "gencr --range=<original base>..<head>." % (args.pr_number, error))
+    if scope_arg and not re.match(r"^--(merge-commit=[0-9a-f]{40}|range=[0-9a-f]{40}\.\.[0-9a-f]{40})$", scope_arg):
+        die("refusing an unexpected scope argument")
+    write_outputs({"scope_arg": scope_arg})
+    return 0
+
+
+# ── previous review (incremental) ─────────────────────────────────────────────
+
+def bot_comments(repo, number):
+    pages = gh("--paginate", "--slurp", "repos/%s/issues/%s/comments?per_page=100" % (repo, number)) or []
+    comments = [c for page in pages for c in (page if isinstance(page, list) else [page])]
+    found = []
+    for comment in comments:
+        body = comment.get("body") or ""
+        if (comment.get("user") or {}).get("login") != BOT_LOGIN or not body.startswith(MARKER):
+            continue
+        try:
+            marker = json.loads(body[len(MARKER):body.index(" -->")])
+        except ValueError:
+            continue
+        found.append((comment, marker))
+    return found
+
+
+def cmd_find_previous(args):
+    """Downloads and verifies the package of the PR's last published review into --out."""
+    try:
+        markers = [m for _, m in bot_comments(args.repo, args.pr_number)]
+        if not markers:
+            raise RuntimeError("no previous gencr review comment on pull request %s" % args.pr_number)
+        marker = markers[-1]
+        if marker.get("backend") != args.backend:
+            raise RuntimeError("the previous review used the %s reviewer backend, not %s"
+                               % (marker.get("backend") or "unknown", args.backend))
+        run_id = str(marker.get("run_id", ""))
+        if not re.match(r"^[0-9]+$", run_id):
+            raise RuntimeError("the previous review comment has no valid run id")
+        run = gh("repos/%s/actions/runs/%s" % (args.repo, run_id))
+        if (run.get("path") != WORKFLOW_PATH or (run.get("repository") or {}).get("full_name") != args.repo
+                or run.get("status") != "completed"):
+            raise RuntimeError("run %s is not a completed %s run of %s" % (run_id, WORKFLOW_PATH, args.repo))
+        name = "code-review-pr-%s" % args.pr_number
+        artifacts = gh("repos/%s/actions/runs/%s/artifacts" % (args.repo, run_id)).get("artifacts") or []
+        matching = [a for a in artifacts if a.get("name") == name and not a.get("expired")]
+        if not matching:
+            raise RuntimeError("the previous review artifact %s of run %s is missing or expired" % (name, run_id))
+        download = tempfile.mkdtemp()
+        proc = subprocess.run(["gh", "run", "download", run_id, "-R", args.repo, "-n", name, "-D", download],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if proc.returncode != 0:
+            raise RuntimeError("cannot download %s: %s" % (name, proc.stderr.decode()[:200].strip()))
+        package = os.path.join(download, name)
+        copy_inert(package if os.path.isdir(package) else download, args.out)
+        metadata = json.load(open(os.path.join(args.out, "metadata.json")))
+        identity = metadata.get("identity") or {}
+        backend = json.load(open(os.path.join(args.out, BACKEND_FILE))).get("backend")
+        if (metadata.get("run_id") != marker.get("review_id") or str(identity.get("pr_number")) != str(args.pr_number)
+                or identity.get("head_sha") != marker.get("reviewed_sha") or backend != args.backend
+                or identity.get("repository") != expected_repository(args.repo)):
+            raise RuntimeError("the downloaded package does not match the published review")
+    except (RuntimeError, OSError, ValueError) as error:
+        die("cannot establish the previous review (%s). Run a fresh review instead." % error)
+    print(args.out)
+    return 0
+
+
+def copy_inert(source, destination):
+    """Copies only expected regular files: no symlinks, subdirectories outside transcripts/, or traversal."""
+    os.makedirs(destination, exist_ok=True)
+    for name in os.listdir(source):
+        path = os.path.join(source, name)
+        if os.path.islink(path):
+            raise RuntimeError("refusing symlink %s in the review package" % name)
+        if name == "transcripts" and os.path.isdir(path):
+            target = os.path.join(destination, name)
+            os.makedirs(target, exist_ok=True)
+            for inner in os.listdir(path):
+                inner_path = os.path.join(path, inner)
+                if os.path.islink(inner_path) or not os.path.isfile(inner_path) or not TRANSCRIPT_RE.match(inner):
+                    raise RuntimeError("unexpected transcript entry %s" % inner)
+                shutil.copyfile(inner_path, os.path.join(target, inner))
+        elif name in ARTIFACT_FILES and os.path.isfile(path):
+            if os.path.getsize(path) > 20 * 1024 * 1024:
+                raise RuntimeError("%s is too large" % name)
+            shutil.copyfile(path, os.path.join(destination, name))
+        else:
+            raise RuntimeError("unexpected entry %s in the review package" % name)
+
+
+# ── package: the artifact uploaded for a run ──────────────────────────────────
+
+def cmd_package(args):
+    """Builds code-review-pr-N/ from the run's package; review prompts/reports go in transcripts/."""
+    runs = [os.path.join(args.output_dir, d) for d in sorted(os.listdir(args.output_dir))
+            if d.startswith("review-")] if os.path.isdir(args.output_dir) else []
+    destination = os.path.join(args.out, "code-review-pr-%s" % args.pr_number)
+    os.makedirs(destination)
+    with open(os.path.join(destination, BACKEND_FILE), "w", encoding="utf-8") as handle:
+        json.dump({"backend": args.backend, "mock": args.backend == "mock"}, handle)
+    if len(runs) != 1:
+        with open(os.path.join(destination, "summary.md"), "w", encoding="utf-8") as handle:
+            handle.write("# gencr review did not produce a report package\n\n- Outcome: INFRASTRUCTURE FAILURE\n")
+        write_outputs({"packaged": "false"})
+        return 0
+    run_dir = runs[0]
+    for name in PACKAGE_FILES:
+        path = os.path.join(run_dir, name)
+        if os.path.isfile(path) and not os.path.islink(path):
+            shutil.copyfile(path, os.path.join(destination, name))
+    transcripts = os.path.join(destination, "transcripts")
+    os.makedirs(transcripts)
+    for name in sorted(os.listdir(run_dir)):
+        path = os.path.join(run_dir, name)
+        if TRANSCRIPT_RE.match(name) and os.path.isfile(path) and not os.path.islink(path):
+            shutil.copyfile(path, os.path.join(transcripts, name))
+    write_outputs({"packaged": "true" if os.path.isfile(os.path.join(destination, "manifest.json")) else "false"})
+    return 0
+
+
+# ── publish: the bot-managed PR comment and the commit status ─────────────────
+
+def expected_repository(repo):
+    """The engine's normalized identity for a repository checked out from GitHub."""
+    return "github.com/" + repo.lower()
+
+
+def neutralize(text):
+    """Keeps review text inert in a GitHub comment: no hidden markers, mentions or HTML comments."""
+    text = text.replace("<!--", "&lt;!--").replace("-->", "--&gt;")
+    return re.sub(r"@(?=[A-Za-z0-9-])", "@​", text)
+
+
+def comment_body(review_comment, marker, artifact_url, retention_days, stale_note):
+    """The bot-managed PR comment: the package's own review comment (summary.md's block, already display-safe and
+    bounded by gencr) wrapped with the bot marker, mock notice, staleness note and the full-report artifact link.
+    CI never selects findings or shortens the review comment itself."""
+    lines = [MARKER + json.dumps(marker, sort_keys=True) + " -->"]
+    if marker.get("backend") == "mock":
+        lines += ["> **MOCK reviewers**: mock reviewer CLIs produced this result to test the workflow. It is not a code "
+                  "review and does not approve this pull request.", ""]
+    if stale_note:
+        lines += ["> " + neutralize(stale_note), ""]
+    lines.append(review_comment.rstrip("\n"))
+    lines += ["", "Complete review (full report, findings.json, reconciliation, metadata): [workflow artifact](%s). "
+              "Workflow artifacts are kept for %s days; they are not permanent PR attachments." % (artifact_url, retention_days)]
+    body = "\n".join(lines) + "\n"
+    if len(body) > COMMENT_LIMIT:
+        raise RuntimeError("the review comment is %d characters, over the %d limit" % (len(body), COMMENT_LIMIT))
+    return body
+
+
+def failure_comment(reason):
+    """The no-valid-result comment when there is no valid package (never a reconstructed review summary)."""
+    return ("## Code review: INFRASTRUCTURE FAILURE — no valid approval or rejection was produced\n"
+            "- Reason: %s\n\nRe-run the review: this result is neither an approval nor a rejection.\n"
+            % neutralize(" ".join(reason.split()))[:500])
+
+
+def failure_metadata(context, reason):
+    """Metadata for a run whose review job produced no package: an infrastructure failure, never approval."""
+    unknown = {"display": "Not reported (no review package)"}
+    return {
+        "review_mode": "UNKNOWN", "approval_scope_label": "None (no review result)", "run_id": "none",
+        "identity": {"head_sha": context["head_sha"], "base_branch": context["base_ref"], "base_tip": "unknown",
+                     "merge_base": "unknown", "instructions_sha256": "unknown"},
+        "models": {"claude": unknown, "codex": unknown}, "primary": "unknown", "adversary": None,
+        "final_verdict": "INFRASTRUCTURE FAILURE", "verdicts": {"claude": "unknown", "codex": "unknown"},
+        "rounds": 0, "max_rounds": 3, "outcome": "INFRASTRUCTURE FAILURE", "category": "infrastructure",
+        "end_reason": reason, "instructions": {"label": "unknown", "file": "unknown"}, "error": reason,
+    }
+
+
+def cmd_publish(args):
+    try:
+        context = pr_context(args.repo, args.pr_number)
+        package = os.path.join(args.package, "code-review-pr-%s" % args.pr_number)
+        metadata = findings = None
+        trusted_sha = args.reviewed_sha if SHA_RE.match(args.reviewed_sha or "") else ""
+        if not trusted_sha:
+            reason = "the review job did not record the reviewed commit (%s)" % (args.review_result or "unknown result")
+        elif os.path.isfile(os.path.join(package, "manifest.json")):
+            try:
+                _, metadata, findings = gencr_support.load_package(package)
+            except ValueError as error:
+                metadata = None
+                reason = "the review package is invalid: %s" % error
+            else:
+                identity = metadata.get("identity") or {}
+                try:
+                    review_comment = gencr_support.gencr_summary.extract(
+                        gencr_support.read_report(os.path.join(package, "summary.md")))
+                except ValueError as error:
+                    metadata, reason = None, "the review package has no valid review comment: %s" % error
+                    identity = {}
+                if metadata is None:
+                    pass
+                elif str(identity.get("pr_number")) != str(args.pr_number):
+                    metadata, reason = None, "the review package does not belong to pull request %s" % args.pr_number
+                elif identity.get("repository") != expected_repository(args.repo):
+                    metadata, reason = None, "the review package is for %s, not %s" % (identity.get("repository"), args.repo)
+                elif identity.get("head_sha") != trusted_sha:
+                    metadata, reason = None, "the review package reviewed %s, not the review job's commit %s" % (
+                        identity.get("head_sha"), trusted_sha)
+                elif args.review_result != "success" and metadata.get("outcome") not in ("REQUEST CHANGES", "UNRESOLVED DISAGREEMENT"):
+                    # A failed or cancelled review job never yields a passing status.
+                    metadata, reason = None, "the review job did not succeed (%s)" % (args.review_result or "unknown")
+        else:
+            reason = "the review job produced no complete package (%s)" % (args.review_result or "unknown result")
+        if metadata is None:
+            metadata = failure_metadata(dict(context, head_sha=trusted_sha or context["head_sha"]), reason)
+            findings = None
+            review_comment = failure_comment(reason)
+        reviewed_sha = metadata["identity"]["head_sha"]
+        outcome = metadata["outcome"]
+
+        marker = {"run_id": int(args.run_id), "run_attempt": int(args.run_attempt), "reviewed_sha": reviewed_sha,
+                  "outcome": outcome, "review_id": metadata.get("run_id"), "review_mode": metadata.get("review_mode"),
+                  "backend": args.backend}
+        existing = bot_comments(args.repo, args.pr_number)
+        newest = existing[-1] if existing else None
+        if newest and (newest[1].get("run_id", 0), newest[1].get("run_attempt", 0)) > (marker["run_id"], marker["run_attempt"]):
+            print("gencr-ci: a newer review (run %s) is already published; not overwriting it" % newest[1].get("run_id"))
+            write_outputs({"published": "skipped-stale", "outcome": outcome})
+            return 0
+        stale_note = ""
+        current = pr_context(args.repo, args.pr_number)["head_sha"]
+        if current != reviewed_sha:
+            stale_note = ("This review covers %s; the pull request head is now %s, so it is not the current verdict."
+                          % (reviewed_sha, current))
+        body = comment_body(review_comment, marker, args.artifact_url or args.run_url, args.retention_days, stale_note)
+        if newest:
+            gh("-X", "PATCH", "repos/%s/issues/comments/%s" % (args.repo, newest[0]["id"]), body={"body": body})
+        else:
+            gh("-X", "POST", "repos/%s/issues/%s/comments" % (args.repo, args.pr_number), body={"body": body})
+        description = "%s (%s)" % (outcome, metadata.get("review_mode", ""))
+        context_name = STATUS_CONTEXT
+        if args.backend == "mock":
+            context_name, description = MOCK_STATUS_CONTEXT, "MOCK pipeline test, not a code review: " + description
+        state = "success" if outcome == "APPROVED" else ("failure" if outcome in REVIEW_OUTCOMES else "error")
+        gh("-X", "POST", "repos/%s/statuses/%s" % (args.repo, reviewed_sha),
+           body={"state": state, "context": context_name, "description": description[:140], "target_url": args.run_url})
+    except (RuntimeError, OSError, ValueError, KeyError) as error:
+        die("publishing failed: %s" % error)
+    write_outputs({"published": "true", "outcome": outcome})
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="gencr-ci")
+    sub = parser.add_subparsers(dest="command")
+    gate = sub.add_parser("gate")
+    for name in ("--ref", "--default-branch", "--backend", "--pr-number", "--scope", "--primary", "--adversary",
+                 "--retention-days", "--timeout-minutes"):
+        gate.add_argument(name, required=True)
+    for name in ("--version", "--claude-model", "--codex-model"):
+        gate.add_argument(name, default="")
+    context = sub.add_parser("context")
+    context.add_argument("--repo", required=True)
+    context.add_argument("--pr-number", required=True)
+    context.add_argument("--expected-sha", default="")
+    historical = sub.add_parser("historical-scope")
+    for name in ("--repo", "--pr-number", "--expected-sha", "--target"):
+        historical.add_argument(name, required=True)
+    previous = sub.add_parser("find-previous")
+    for name in ("--repo", "--pr-number", "--out", "--backend"):
+        previous.add_argument(name, required=True)
+    package = sub.add_parser("package")
+    for name in ("--output-dir", "--pr-number", "--out", "--backend"):
+        package.add_argument(name, required=True)
+    publish = sub.add_parser("publish")
+    for name in ("--repo", "--pr-number", "--run-id", "--run-attempt", "--package", "--run-url", "--retention-days",
+                 "--backend"):
+        publish.add_argument(name, required=True)
+    for name in ("--artifact-url", "--reviewed-sha", "--review-result"):
+        publish.add_argument(name, default="")
+    args = parser.parse_args()
+    handlers = {"gate": cmd_gate, "context": cmd_context, "historical-scope": cmd_historical_scope,
+                "find-previous": cmd_find_previous,
+                "package": cmd_package, "publish": cmd_publish}
+    if args.command not in handlers:
+        parser.print_usage(sys.stderr)
+        return 2
+    return handlers[args.command](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
