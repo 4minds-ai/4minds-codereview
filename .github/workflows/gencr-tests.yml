@@ -61,3 +61,6 @@ jobs:
 
       - name: Field value tests
         run: bash tests/test_gencr_values.sh
+
+      - name: gencrclaude (original Claude workflow) tests
+        run: bash tests/test_gencrclaude.sh
