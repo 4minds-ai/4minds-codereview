@@ -31,5 +31,6 @@ docker run --rm -v "$repo:/src:ro" "$image" bash -c '
     bash tests/test_gencr_notes.sh
     bash tests/test_gencr_values.sh
     bash tests/test_gencrclaude.sh
+    bash tests/test_gencr_auto.sh
   "
 '

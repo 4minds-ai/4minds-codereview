@@ -155,13 +155,13 @@ check "'gencr <dev>' uses the structured report contract (the prompt requires Re
   file_contains "$MOCK_STATE/call-1.stdin" '"## Review notes": the last section'
 reset_mocks
 queue_single 1 claude "REQUEST CHANGES"
-run_gencr plain
+run_gencr plain-rc
 check "'gencr <dev>' exits 10 on REQUEST CHANGES (a completed review)" eval '[ "$STATUS" -eq 10 ] && [ "$(calls)" -eq 1 ]'
 reset_mocks
 queue_single 1 claude APPROVED
 edit_in_place "$MOCK_STATE/responses/1" '/^## Review notes/,/^- Other observations/d'
-run_gencr plain
-check "'gencr <dev>' exits 20 INCOMPLETE on an invalid report" eval '[ "$STATUS" -eq 20 ] && [ "$(json_get "$(pkg plain)/metadata.json" "d[\"outcome\"]")" = INCOMPLETE ]'
+run_gencr plain-bad
+check "'gencr <dev>' exits 20 INCOMPLETE on an invalid report" eval '[ "$STATUS" -eq 20 ] && [ "$(json_get "$(pkg plain-bad)/metadata.json" "d[\"outcome\"]")" = INCOMPLETE ]'
 reset_mocks
 actual="$(cd "$TARGET" && "$GENCR" 2>&1)"; status=$?
 check "'gencr' without a dev-username is a usage error (exit 2), not the old prompt" \
@@ -741,8 +741,8 @@ inc_reject "a merge-base that moved (base merged in)" "the merge-base changed" -
 git -C "$TARGET" reset -q --hard pre-rewrite
 reset_mocks
 run_gencr inc --codex=review --incremental --output-dir="$INC_DIR" --pr-number=42 --print
-check "without --previous, the newest compatible package is selected" \
-  contains "$OUT" "follow-up to review $(json_get "$CARRY_PKG/metadata.json" 'd["run_id"]')"
+check "without --previous, the latest compatible review is selected (here it already covers HEAD: nothing to review)" \
+  eval '[ "$STATUS" -eq 0 ] && contains "$ERR" "no new review needed: review $(json_get "$CARRY_PKG/metadata.json" "d[\"run_id\"]") (verdict REQUEST CHANGES) already covers HEAD" && [ "$(calls)" -eq 0 ]'
 
 # A blocker defined in an earlier round and only cited in the final reports stays open and must be
 # verified by the next incremental review.
@@ -1059,7 +1059,8 @@ mkdir -p "$HOME/tilde prev"
 cp -R "$(tilde_pkg "tilde out/eq form")" "$HOME/tilde prev/pkg"
 reset_mocks
 run_gencr tilde1 --claude=review --incremental '--output-dir=~/tilde out/eq form' --previous '~/tilde prev/pkg' --print
-check "--previous ~/... (space form) is expanded too" eval '[ "$STATUS" -eq 0 ] && contains "$OUT" "Review mode: INCREMENTAL"'
+check "--previous ~/... (space form) is expanded too (the package is read: it covers HEAD)" \
+  eval '[ "$STATUS" -eq 0 ] && contains "$ERR" "no new review needed: review $(json_get "$HOME/tilde prev/pkg/metadata.json" "d[\"run_id\"]")"'
 
 reset_mocks
 queue_single 1 claude APPROVED

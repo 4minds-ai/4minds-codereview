@@ -46,7 +46,8 @@ git -C "$TARGET" checkout -q -b feature
 printf 'def sync():\n    return 1\n' > "$TARGET/app.py"
 git -C "$TARGET" add . && git -C "$TARGET" commit -qm feature
 
-reset_mocks() { rm -rf "$MOCK_STATE"; mkdir -p "$MOCK_STATE/responses"; }
+# Every scenario is an independent first review: no earlier package of the same developer may be its baseline.
+reset_mocks() { rm -rf "$MOCK_STATE" "${HOME:?}/Documents/CodeReview"; mkdir -p "$MOCK_STATE/responses"; }
 calls() { cat "$MOCK_STATE/count" 2>/dev/null || echo 0; }
 rid() { printf '%02d-round%d-%s-%s' "$1" "$2" "$3" "$4"; }
 run_gencr() { # DEV ARGS...

@@ -64,3 +64,6 @@ jobs:
 
       - name: gencrclaude (original Claude workflow) tests
         run: bash tests/test_gencrclaude.sh
+
+      - name: Automatic review-mode tests
+        run: bash tests/test_gencr_auto.sh

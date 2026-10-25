@@ -21,7 +21,6 @@ sys.dont_write_bytecode = True  # never leave __pycache__ beside the installed s
 SCHEMA = 1
 CLAUDE_TOOLS = "Read,Grep,Glob"
 CLAUDE_DENIED_TOOLS = "Bash,Edit,Write,NotebookEdit"
-ELIGIBLE_PREVIOUS = ("APPROVED", "REQUEST CHANGES", "UNRESOLVED DISAGREEMENT")
 PACKAGE_FILES = ("summary.md", "full-report.md", "findings.json", "reconciliation.md", "metadata.json")
 import gencr_report  # noqa: E402  (the one report grammar)
 import gencr_summary  # noqa: E402  (the GitHub-ready review comment)
@@ -348,6 +347,8 @@ def load_package(path):
     if os.path.islink(run_dir) or not os.path.isfile(manifest_path):
         raise ValueError("no complete review package (manifest.json missing)")
     manifest = json.loads(read_text(manifest_path))
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("files"), dict):
+        raise ValueError("manifest.json is not a package manifest object")
     if manifest.get("schema") != SCHEMA or manifest.get("complete") is not True:
         raise ValueError("unsupported or incomplete package manifest")
     for name, digest in (manifest.get("files") or {}).items():
@@ -359,10 +360,18 @@ def load_package(path):
             raise ValueError("package lacks %s" % name)
     metadata = json.loads(read_text(os.path.join(run_dir, "metadata.json")))
     findings = json.loads(read_text(os.path.join(run_dir, "findings.json")))
+    if not isinstance(metadata, dict) or not isinstance(findings, dict):
+        raise ValueError("metadata.json or findings.json is not a JSON object")
     if metadata.get("schema") != SCHEMA:
         raise ValueError("unsupported metadata schema")
-    open_ids = {f.get("id") for f in findings.get("final_findings") or []}
-    for agent_blockers in (findings.get("blockers") or {}).values():
+    final = findings.get("final_findings") or []
+    if not isinstance(final, list) or not all(isinstance(f, dict) for f in final):
+        raise ValueError("findings.json final_findings is not a list of findings")
+    open_ids = {f.get("id") for f in final}
+    blockers = findings.get("blockers") or {}
+    if not isinstance(blockers, dict) or not all(isinstance(v, list) for v in blockers.values()):
+        raise ValueError("findings.json blockers is not a mapping of finding-ID lists")
+    for agent_blockers in blockers.values():
         missing = set(agent_blockers) - open_ids
         if missing:
             raise ValueError("inconsistent package: merge blockers %s are not open findings" % ", ".join(sorted(missing)))
@@ -390,76 +399,181 @@ def scope_check(identity, args):
         raise ValueError("it used the %s scope method, but HEAD now resolves by %s" % (method, args.scope_method))
 
 
-def cmd_previous(args):
-    if args.previous:
-        candidates = [os.path.realpath(args.previous)]
-    else:
-        candidates = []
-        if os.path.isdir(args.search_dir):
-            for name in sorted(os.listdir(args.search_dir)):
-                if name.startswith("review-"):
-                    candidates.append(os.path.join(args.search_dir, name))
-    accepted, reasons = [], []
-    for candidate in candidates:
-        try:
-            run_dir, metadata, findings = load_package(candidate)
-            identity = metadata.get("identity") or {}
-            checks = (
-                ("outcome", metadata.get("outcome") in ELIGIBLE_PREVIOUS,
-                 "outcome %s is not a completed review" % metadata.get("outcome")),
-                ("repository", identity.get("repository") == args.repository, "different repository"),
-                ("pr", identity.get("pr_number") == (args.pr_number or None), "different pull request"),
-                ("branch", identity.get("branch") == args.branch, "different branch"),
-                ("base", identity.get("base_branch") == args.base_branch, "different base branch"),
-                ("instructions", (identity.get("instructions_version"), identity.get("instructions_sha256"))
-                 == (args.instructions_version, args.instructions_sha256), "different review instructions"),
-            )
-            for _, ok, reason in checks:
-                if not ok:
-                    raise ValueError(reason)
-            scope_check(identity, args)
-            if identity.get("merge_base") != args.merge_base:
-                raise ValueError("the merge-base changed (base merged or rebased)")
-            reviewed = identity.get("head_sha") or ""
-            if not re.match(r"^[0-9a-f]{40}$", reviewed):
-                raise ValueError("no reviewed commit SHA recorded")
-            if not git_is_ancestor(args.repo, reviewed, args.head):
-                raise ValueError("reviewed commit %s is not an ancestor of HEAD (force push or rebase)" % reviewed[:12])
-            open_findings = findings.get("final_findings") or []
-            if reviewed == args.head and not open_findings:
-                raise ValueError("HEAD is the reviewed commit and no findings remain open")
-            accepted.append((metadata.get("completed_at") or "", run_dir, metadata, findings))
-        except (ValueError, OSError) as error:
-            reasons.append("%s: %s" % (os.path.basename(candidate.rstrip("/")), error))
-    if not accepted:
-        detail = "; ".join(reasons[-5:]) if reasons else "no previous review packages found in %s" % args.search_dir
-        die("cannot establish a reliable incremental baseline (%s). Run with --fresh instead." % detail)
-    accepted.sort(key=lambda item: item[0])
-    _, run_dir, metadata, findings = accepted[-1]
-    identity = metadata["identity"]
-    open_findings = findings.get("final_findings") or []
-    lineage = sorted(set(findings.get("lineage_ids") or []) | {f["id"] for f in open_findings})
-    result = {
-        "id": metadata.get("run_id"), "path": run_dir, "reviewed_sha": identity["head_sha"],
-        "merge_base": identity.get("merge_base"), "outcome": metadata.get("outcome"),
-        "review_mode": metadata.get("review_mode"), "completed_at": metadata.get("completed_at"),
-        "open_findings": open_findings, "lineage_ids": lineage,
-    }
+COMPLETED_OUTCOMES = ("APPROVED", "REQUEST CHANGES", "UNRESOLVED DISAGREEMENT")
+ISO_UTC_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+
+
+def evaluate_previous(candidate, args):
+    """A candidate package checked against the current review identity: (record, None) or (None, reason). Every
+    failure, including valid JSON of the wrong shape, is a rejection reason; nothing here aborts discovery."""
+    try:
+        run_dir, metadata, findings = load_package(candidate)
+        if not isinstance(metadata, dict) or not isinstance(findings, dict):
+            raise ValueError("metadata.json or findings.json is not a JSON object")
+        identity = metadata.get("identity")
+        if not isinstance(identity, dict):
+            raise ValueError("metadata has no review identity")
+        outcome = metadata.get("outcome")
+        checks = (
+            (outcome in COMPLETED_OUTCOMES, "outcome %s is not a completed review" % outcome),
+            (identity.get("repository") == args.repository, "different repository"),
+            (metadata.get("developer") == args.dev, "different developer"),
+            (identity.get("pr_number") == (args.pr_number or None), "different pull request"),
+            (identity.get("branch") == args.branch, "different branch"),
+            (identity.get("base_branch") == args.base_branch, "different base branch"),
+            ((identity.get("instructions_version"), identity.get("instructions_sha256"))
+             == (args.instructions_version, args.instructions_sha256), "different review instructions"),
+        )
+        for ok, reason in checks:
+            if not ok:
+                raise ValueError(reason)
+        scope_check(identity, args)
+        if identity.get("merge_base") != args.merge_base:
+            raise ValueError("the merge-base changed (base merged or rebased)")
+        reviewed = identity.get("head_sha") or ""
+        if not isinstance(reviewed, str) or not re.match(r"^[0-9a-f]{40}$", reviewed):
+            raise ValueError("no reviewed commit SHA recorded")
+        if not git_is_ancestor(args.repo, reviewed, args.head):
+            raise ValueError("reviewed commit %s is not an ancestor of HEAD (force push or rebase)" % reviewed[:12])
+        open_findings = findings.get("final_findings") or []
+        if not isinstance(open_findings, list) or not all(isinstance(f, dict) for f in open_findings):
+            raise ValueError("findings.json final_findings is not a list of findings")
+        completed_at = metadata.get("completed_at")
+        rounds = metadata.get("rounds", 0)
+        return {"path": run_dir, "metadata": metadata, "findings": findings, "id": metadata.get("run_id"),
+                "reviewed_sha": reviewed, "outcome": outcome, "open_findings": open_findings,
+                "completed_at": completed_at if isinstance(completed_at, str) and ISO_UTC_RE.match(completed_at)
+                else None, "rounds": rounds if isinstance(rounds, int) else None}, None
+    except (ValueError, OSError, TypeError, AttributeError, KeyError) as error:
+        return None, "%s: %s" % (os.path.basename(candidate.rstrip("/")), error)
+
+
+def review_frontier(records, repo):
+    """(frontier, ambiguous): the completed reviews furthest along HEAD's history. A review whose reviewed commit is
+    a proper ancestor of another's is superseded; several reviews of one commit are ordered by their validated
+    completion time, and a tie or a missing time is ambiguous. Several distinct commits on the frontier (a merge DAG)
+    are ambiguous too: gencr never guesses."""
+    by_sha = {}
+    for record in records:
+        by_sha.setdefault(record["reviewed_sha"], []).append(record)
+    shas = list(by_sha)
+    maximal = [a for a in shas if not any(a != b and git_is_ancestor(repo, a, b) for b in shas)]
+    frontier, ambiguous = [], len(maximal) > 1
+    for sha in maximal:
+        group = by_sha[sha]
+        if len(group) > 1:
+            times = [r["completed_at"] for r in group]
+            if None in times or len(set(times)) != len(times):
+                ambiguous = True
+                frontier += group
+                continue
+            group = sorted(group, key=lambda r: r["completed_at"])[-1:]
+        frontier += group
+    return frontier, ambiguous
+
+
+def write_previous(args, chosen, extra):
+    open_findings = chosen["open_findings"]
+    findings = chosen["findings"]
+    lineage = sorted(set(findings.get("lineage_ids") or []) | {f.get("id") for f in open_findings if f.get("id")})
+    result = dict({
+        "id": chosen["id"], "path": chosen["path"], "reviewed_sha": chosen["reviewed_sha"],
+        "merge_base": chosen["metadata"]["identity"].get("merge_base"), "outcome": chosen["outcome"],
+        "review_mode": chosen["metadata"].get("review_mode"), "completed_at": chosen["completed_at"],
+        "rounds_used": chosen["rounds"], "open_findings": open_findings, "lineage_ids": lineage,
+    }, **extra)
     with open(args.out, "w", encoding="utf-8") as handle:
         json.dump(result, handle, indent=2)
     with open(args.out + ".fields", "wb") as handle:
-        for value in (result["id"], result["reviewed_sha"], result["path"]):
+        for value in (result["id"], result["reviewed_sha"], result["path"], result["outcome"],
+                      "" if result["rounds_used"] is None else result["rounds_used"],
+                      extra.get("newer_unresolved") or ""):
             handle.write(str(value).encode("utf-8") + b"\0")
     with open(args.out + ".ids", "w", encoding="utf-8") as handle:
-        handle.write("".join(i + "\n" for i in sorted({f["id"] for f in open_findings}, key=id_sort_key)))
+        handle.write("".join(i + "\n" for i in sorted({f["id"] for f in open_findings if f.get("id")}, key=id_sort_key)))
     with open(args.out + ".lineage", "w", encoding="utf-8") as handle:
         handle.write("".join(i + "\n" for i in sorted(lineage, key=id_sort_key)))
     with open(args.out + ".files", "wb") as handle:
         for finding in open_findings:
-            path = re.sub(r":[0-9][0-9,\-]*$", "", (finding.get("file") or "").strip().strip("`"))
+            path = re.sub(r":[0-9][0-9,\-]*$", "", str(finding.get("file") or "").strip().strip("`"))
             if path and not path.startswith("/") and ".." not in path.split("/"):
                 handle.write(path.encode("utf-8") + b"\0")
+
+
+def describe(record):
+    return "%s (reviewed %s, %s)" % (record["id"], record["reviewed_sha"][:12], record["outcome"])
+
+
+def cmd_no_review(args):
+    """Writes the covered-HEAD no-review receipt atomically; refuses to replace anything."""
+    if os.path.lexists(args.out):
+        die("%s already exists" % args.out)
+    record = {"schema": SCHEMA, "kind": "covered", "previous_id": args.previous_id,
+              "previous_reviewed_sha": args.previous_sha, "previous_outcome": args.previous_outcome,
+              "head_sha": args.head, "written_by": "gencr"}
+    temporary = args.out + ".tmp"
+    with open(temporary, "x", encoding="utf-8") as handle:
+        json.dump(record, handle, indent=2)
+    os.link(temporary, args.out)  # fails if a receipt appeared meanwhile; never overwrites
+    os.unlink(temporary)
     return 0
+
+
+def cmd_previous(args):
+    """Selects the review baseline. --mode incremental (explicit --incremental), auto (no scope option) or fresh-check
+    (explicit --fresh: is there a previous review to confirm against?). Writes <out>.decision (one word) and, for a
+    baseline, the selected package files. Exit 0 = run incremental from the baseline, 3 = no compatible previous review
+    (auto: FRESH), 4 = the baseline already covers HEAD (no new review needed), 5 = stop: a decision is required; a
+    fatal error dies with the reason."""
+    def decide(word, message=None, code=0):
+        with open(args.out + ".decision", "w", encoding="utf-8") as handle:
+            handle.write(word + "\n" + (message or "") + "\n")
+        return code
+
+    scanned, reasons = [], []
+    if os.path.isdir(args.search_dir):
+        for name in sorted(os.listdir(args.search_dir)):
+            if name.startswith("review-"):
+                record, reason = evaluate_previous(os.path.join(args.search_dir, name), args)
+                (scanned.append(record) if record else reasons.append(reason))
+    frontier, ambiguous = review_frontier(scanned, args.repo)
+    if args.mode == "fresh-check":
+        return decide("previous", describe(frontier[0]) if frontier else "") if scanned else decide("none", "", 3)
+    stop_hint = ("Add --incremental --previous=<package> to choose a baseline, or --fresh to start over. "
+                 "No reviewer was launched.")
+    if args.previous:
+        chosen, reason = evaluate_previous(os.path.realpath(args.previous), args)
+        if not chosen:
+            die("cannot use %s as the incremental baseline (%s). Run with --fresh instead." % (args.previous, reason))
+        newer = [r for r in scanned if r["outcome"] == "UNRESOLVED DISAGREEMENT" and r["path"] != chosen["path"]
+                 and (git_is_ancestor(args.repo, chosen["reviewed_sha"], r["reviewed_sha"]))
+                 and (r["reviewed_sha"] != chosen["reviewed_sha"]
+                      or (r["completed_at"] or "") > (chosen["completed_at"] or ""))]
+        extra = {"newer_unresolved": ", ".join(sorted(r["id"] for r in newer)) or None}
+    else:
+        if not frontier:
+            if args.mode == "auto":
+                detail = reasons[-1] if reasons else "none found in %s" % args.search_dir
+                return decide("none", detail, 3)
+            detail = "; ".join(reasons[-5:]) if reasons else "no previous review packages found in %s" % args.search_dir
+            die("cannot establish a reliable incremental baseline (%s). Run with --fresh instead." % detail)
+        if ambiguous:
+            listing = "; ".join(describe(r) + " at " + r["path"] for r in frontier)
+            message = ("several previous reviews could be the baseline and none is unambiguously the latest: %s. %s"
+                       % (listing, stop_hint))
+            if args.mode == "auto":
+                return decide("ambiguous", message, 5)
+            die(message)
+        chosen = frontier[0]
+        if chosen["outcome"] == "UNRESOLVED DISAGREEMENT" and args.mode == "auto":
+            return decide("unresolved", "review %s ended UNRESOLVED DISAGREEMENT; gencr does not continue it "
+                          "automatically. Add --incremental to continue it (its open findings are kept) or --fresh to "
+                          "start over. No reviewer was launched." % describe(chosen), 5)
+        extra = {"newer_unresolved": None}
+    write_previous(args, chosen, extra)
+    if chosen["reviewed_sha"] == args.head and chosen["outcome"] != "UNRESOLVED DISAGREEMENT":
+        return decide("covered", "", 4)
+    return decide("baseline", "", 0)
 
 
 def id_sort_key(identifier):
@@ -704,6 +818,13 @@ def build_package(args):
     if incremental:
         previous = {"id": state.get("previous_id"), "reviewed_sha": state.get("previous_sha"),
                     "path": state.get("previous_path")}
+        # Additive fields (absent in packages written before automatic review selection).
+        if state.get("previous_outcome"):
+            previous["outcome"] = state["previous_outcome"]
+        if (state.get("previous_rounds") or "").isdigit():
+            previous["rounds_used"] = int(state["previous_rounds"])
+        if state.get("previous_newer_unresolved"):
+            previous["newer_unresolved"] = state["previous_newer_unresolved"]
     outcome = state["outcome"]
     adversary = state.get("adversary") or None
     verdicts = {}
@@ -1173,6 +1294,9 @@ def main():
     repo_id = sub.add_parser("repo-id")
     repo_id.add_argument("--url", default="")
     repo_id.add_argument("--root", required=True)
+    no_review = sub.add_parser("no-review")
+    for name in ("--out", "--previous-id", "--previous-sha", "--previous-outcome", "--head"):
+        no_review.add_argument(name, required=True)
     previous = sub.add_parser("previous")
     for name in ("--search-dir", "--repo", "--repository", "--branch", "--base-branch", "--merge-base", "--head",
                  "--instructions-sha256", "--out"):
@@ -1182,6 +1306,8 @@ def main():
     previous.add_argument("--previous", default="")
     previous.add_argument("--scope-method", default="merge-base")
     previous.add_argument("--merge-commit", default="")
+    previous.add_argument("--dev", required=True)
+    previous.add_argument("--mode", choices=("incremental", "auto", "fresh-check"), default="incremental")
     review_comment = sub.add_parser("review-comment")
     review_comment.add_argument("--summary", required=True)
     sub.add_parser("value-rule")
@@ -1226,7 +1352,7 @@ def main():
         args.instructions_version = args.instructions_version or None
         args.pr_number = args.pr_number or None
     handlers = {"invoke": cmd_invoke, "trusted-settings": cmd_trusted_settings, "repo-id": cmd_repo_id,
-                "previous": cmd_previous, "package": cmd_package, "duplicates": cmd_duplicates,
+                "previous": cmd_previous, "no-review": cmd_no_review, "package": cmd_package, "duplicates": cmd_duplicates,
                 "validate-duplication": cmd_validate_duplication,
                 "sha256": lambda a: print(sha256_file(a.file)) or 0,
                 "realpath": lambda a: print(os.path.realpath(a.path)) or 0, "outside-repo": cmd_outside_repo,

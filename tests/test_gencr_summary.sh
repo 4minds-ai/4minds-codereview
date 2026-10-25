@@ -43,7 +43,8 @@ printf 'def handler():\n    return 1\n' > "$TARGET/app.py"
 git -C "$TARGET" add . && git -C "$TARGET" commit -qm feature
 HEAD_SHA="$(git -C "$TARGET" rev-parse HEAD)"
 
-reset_mocks() { rm -rf "$MOCK_STATE"; mkdir -p "$MOCK_STATE/responses"; }
+# Every scenario is an independent first review: no earlier package of the same developer may be its baseline.
+reset_mocks() { rm -rf "$MOCK_STATE" "${HOME:?}/Documents/CodeReview"; mkdir -p "$MOCK_STATE/responses"; }
 calls() { cat "$MOCK_STATE/count" 2>/dev/null || echo 0; }
 rid() { printf '%02d-round%d-%s-%s' "$1" "$2" "$3" "$4"; }
 run_gencr() { # [env assignments via env] ARGS...
@@ -107,7 +108,7 @@ check "local run: the report path is printed after the END marker, not inside th
         ! contains "$BLOCK" "$HOME" && ! contains "$BLOCK" "$WORK" && ! contains "$BLOCK" "/Documents/"'
 check "local run: the full report is not dumped (no evidence, no file list, no dispositions section)" \
   eval '! contains "$OUT" "EVIDENCE-SENTINEL" && ! contains "$OUT" "## Files examined" && ! contains "$OUT" "problem text" && [ "$(printf "%s\n" "$OUT" | wc -l)" -lt 60 ]'
-check "local run: stderr keeps the final-verdict line" eval 'contains "$ERR" "gencr: final verdict: REQUEST CHANGES; report:"'
+check "local run: stderr keeps the final-verdict line" eval 'contains "$ERR" "gencr: final verdict: ❌ REQUEST CHANGES; report:"'
 check "minimal metadata: verdict, mode, reviewed SHA, actual models" \
   eval 'contains "$BLOCK" "- Mode: FRESH" && contains "$BLOCK" "- Reviewed commit: $HEAD_SHA" && contains "$BLOCK" "Claude: mock-claude-default; Codex: mock-codex-default" && ! contains "$BLOCK" "Run ID"'
 check "merge blockers first and ranked by severity, before other significant findings (low blocker before high non-blocker)" \
@@ -213,6 +214,8 @@ gen 1 '{"verdict": "APPROVED"}'
 (cd "$TARGET" && GENCR_REVIEW_COMMENT=off "$REPO/bin/gencr" dev --claude=review) > "$WORK/stdout" 2> "$WORK/stderr"; STATUS=$?
 check "GENCR_REVIEW_COMMENT=off (CI): one line, no copy block, same exit code" \
   eval '[ "$STATUS" -eq 0 ] && [ "$(cat "$WORK/stdout")" = "gencr: APPROVED; the review comment is summary.md in the review package" ]'
+reset_mocks
+gen 1 '{"verdict": "APPROVED"}'
 (cd "$TARGET" && GITHUB_ACTIONS=true CI=true "$REPO/bin/gencr" dev --claude=review) > "$WORK/stdout" 2> /dev/null
 check "GITHUB_ACTIONS or CI alone does not suppress the local block" eval 'grep -qx "========== GITHUB REVIEW COMMENT ==========" "$WORK/stdout"'
 run_gencr --print

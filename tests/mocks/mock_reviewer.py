@@ -120,9 +120,11 @@ def with_duplication_check(report):
     """Adds the incremental Duplication check, built from the subjects/candidates in this prompt."""
     subjects = re.findall(r"^  - (SUBJ-\d+) \[", prompt, re.M)
     candidates = re.findall(r"^  - (DUP-\d+) \(", prompt, re.M)
-    if not subjects or "## Duplication check" in report or (state and os.path.exists(path("no-auto-dup-%d" % n))):
+    incremental = '"## Duplication check": one bullet' in prompt
+    if (not subjects and not incremental) or "## Duplication check" in report \
+            or (state and os.path.exists(path("no-auto-dup-%d" % n))):
         return report
-    lines = ["## Duplication check"]
+    lines = ["## Duplication check"] + ([] if subjects or candidates else ["- None"])
     lines += ["- %s: no duplicate found — searched: mock query for %s; compared: none" % (s, s) for s in subjects]
     lines += ["- %s: not duplicate — mock comparison of both snippets" % c for c in candidates]
     # Before "## Review notes" (the last section) when the report has one, else before the control lines.

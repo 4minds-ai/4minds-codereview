@@ -32,11 +32,15 @@ Reviewers:
 
 Scope and instructions:
   -v=N, --version=N    Use dotfiles/claude/CODE_REVIEW_VERSION_N.md (default: CODE_REVIEW.md).
-  --fresh              Review the complete PR change set against the base (the default).
-  --incremental        Review the changes since a previous review and verify its findings.
+  (no scope option)    Automatic: INCREMENTAL from the latest compatible completed review of this
+                       branch in the output directory, FRESH when there is none.
+  --fresh              Review the complete PR change set against the base, ignoring previous
+                       reviews as a baseline (asks to confirm on a terminal when one exists).
+  --incremental        Review the changes since a previous review and verify its findings
+                       (fails when there is no compatible previous review).
   --previous=PATH, --previous PATH
-                       Previous review package for --incremental (default: the newest
-                       compatible package in the output directory).
+                       Previous review package for --incremental (default: the latest
+                       compatible completed review in the output directory).
   --range=BASE..HEAD, --range BASE..HEAD
                        FRESH review of exactly these commits (SHAs; HEAD must be checked out),
                        for example a merged pull request whose original base you know.
@@ -56,9 +60,11 @@ Execution and output:
 
 Headless reviews run the CLIs read-only and save summary.md, full-report.md, findings.json,
 reconciliation.md and metadata.json in a new review-* directory. Adversarial reviews stop after
-at most 3 reconciliation rounds. Exit status: 0 APPROVED, 10 REQUEST CHANGES, 11 UNRESOLVED
-DISAGREEMENT, 20 INCOMPLETE, 21 reviewer failure, 22 timeout, 23 report could not be saved,
-2 usage error, 1 other error. The base branch is origin/$CODEREVIEW_BASE_BRANCH (default staging).
+at most 3 reconciliation rounds per run. Exit status: 0 APPROVED (or no new review needed: the
+previous review already covers HEAD; it says so and launches nothing), 10 REQUEST CHANGES,
+11 UNRESOLVED DISAGREEMENT, 20 INCOMPLETE, 21 reviewer failure, 22 timeout, 23 report could not
+be saved, 2 usage error, 1 other error (including a cancelled FRESH confirmation or a review mode
+that needs your decision). The base branch is origin/$CODEREVIEW_BASE_BRANCH (default staging).
 
 Examples:
   gencr swalker --version=2
@@ -222,7 +228,6 @@ parse_args() {
   [ "$OPT_RANGE_SET$OPT_MERGE_COMMIT_SET" != 11 ] || die_usage "use only one of --range and --merge-commit"
   [ "$OPT_RANGE_SET$OPT_MERGE_COMMIT_SET" = 00 ] || [ "$OPT_SCOPE" != incremental ] \
     || die_usage "--range and --merge-commit select a FRESH review scope; they cannot be combined with --incremental"
-  [ -n "$OPT_SCOPE" ] || OPT_SCOPE=fresh
 }
 
 check_reviewer_mode() {
@@ -482,15 +487,115 @@ load_fresh_scope() {
 }
 
 # INCREMENTAL: changes since a validated previous review, plus the files its open findings cite.
-load_incremental_scope() {
+# The support previous arguments for this review identity ($1 mode).
+previous_args() {
   PREVIOUS_JSON="$WORK_DIR/previous.json"
-  support previous --search-dir "$REPORT_DIR" --repo "$REPO_ROOT" --repository "$REPOSITORY" \
-    --branch "$RAW_BRANCH" --base-branch "$BASE_BRANCH" --merge-base "$MERGE_BASE" --head "$HEAD_SHA" \
-    --instructions-sha256 "$INSTRUCTIONS_SHA256" --instructions-version "$INSTRUCTIONS_VERSION" \
-    --pr-number "$OPT_PR" --previous "$OPT_PREVIOUS" --scope-method "$SCOPE_METHOD" --merge-commit "$MERGE_COMMIT" \
-    --out "$PREVIOUS_JSON" || exit 1
-  { IFS= read -r -d '' PREVIOUS_ID && IFS= read -r -d '' PREVIOUS_SHA && IFS= read -r -d '' PREVIOUS_PATH; } \
-    < "$PREVIOUS_JSON.fields" || die "cannot read the previous review selected for --incremental"
+  PREVIOUS_ARGS=(previous --mode "$1" --search-dir "$REPORT_DIR" --repo "$REPO_ROOT" --repository "$REPOSITORY"
+    --dev "$OPT_DEV" --branch "$RAW_BRANCH" --base-branch "$BASE_BRANCH" --merge-base "$MERGE_BASE" --head "$HEAD_SHA"
+    --instructions-sha256 "$INSTRUCTIONS_SHA256" --instructions-version "$INSTRUCTIONS_VERSION"
+    --pr-number "$OPT_PR" --previous "$OPT_PREVIOUS" --scope-method "$SCOPE_METHOD" --merge-commit "$MERGE_COMMIT"
+    --out "$PREVIOUS_JSON")
+}
+
+read_previous_fields() {
+  { IFS= read -r -d '' PREVIOUS_ID && IFS= read -r -d '' PREVIOUS_SHA && IFS= read -r -d '' PREVIOUS_PATH &&
+    IFS= read -r -d '' PREVIOUS_OUTCOME && IFS= read -r -d '' PREVIOUS_ROUNDS &&
+    IFS= read -r -d '' PREVIOUS_NEWER_UNRESOLVED; } < "$PREVIOUS_JSON.fields" \
+    || die "cannot read the previous review selected as the baseline"
+}
+
+# The second line of the selection's decision record (its message).
+decision_message() {
+  sed -n 2p "$PREVIOUS_JSON.decision"
+}
+
+# The previous review already covers HEAD: no reviewer is launched. With --output-dir (CI passes a new, empty one), a
+# no-review receipt records the decision for the CI adapter; it is written last and only into a directory that holds
+# no review package or receipt. Exits 0: "no new review needed", never an approval.
+no_new_review() {
+  read_previous_fields
+  echo "gencr: no new review needed: review ${PREVIOUS_ID} (verdict ${PREVIOUS_OUTCOME}) already covers HEAD $(short "$HEAD_SHA"); no reviewer was launched. Run with --fresh to start over." >&2
+  if [ "$OPT_PRINT" -eq 0 ] && [ "$OPT_OUTPUT_DIR_SET" -eq 1 ] && [ ! -e "$REPORT_DIR/no-review.json" ] \
+      && ! ls -d "$REPORT_DIR"/review-* >/dev/null 2>&1; then
+    support no-review --out "$REPORT_DIR/no-review.json" --previous-id "$PREVIOUS_ID" \
+      --previous-sha "$PREVIOUS_SHA" --previous-outcome "$PREVIOUS_OUTCOME" --head "$HEAD_SHA" \
+      || die "cannot record the no-review decision in ${REPORT_DIR}"
+  fi
+  exit 0
+}
+
+# Explicit --fresh while a previous review of this branch exists: confirm on the controlling terminal (never stdin),
+# within one 15-second deadline (default yes). Without a terminal, or with --print, it does not ask.
+confirm_fresh() {
+  [ "$OPT_PRINT" -eq 0 ] || return 0
+  { exec 3<>/dev/tty; } 2>/dev/null || return 0
+  if [ ! -t 3 ]; then exec 3>&-; return 0; fi
+  local deadline remaining reply
+  printf '%s\n\n%s\n\n%s' "Previous code review detected for this branch." \
+    "A FRESH review will start over and ignore the previous review as its baseline." \
+    "Continue with FRESH? [Y/n] (15 seconds; default Y) " >&3
+  deadline=$(( $(date +%s) + 15 ))
+  while :; do
+    remaining=$(( deadline - $(date +%s) ))
+    if [ "$remaining" -le 0 ] || ! IFS= read -r -t "$remaining" -u 3 reply; then
+      printf '\n' >&3
+      echo "gencr: no answer within 15 seconds; continuing with FRESH" >&2
+      break
+    fi
+    case "$reply" in
+      ""|y|Y|yes|Yes|YES) break ;;
+      n|N|no|No|NO)
+        exec 3>&-
+        echo "gencr: FRESH review cancelled; no reviewer was launched" >&2
+        exit 1 ;;
+      *) printf 'Please answer y or n: ' >&3 ;;
+    esac
+  done
+  exec 3>&-
+}
+
+# Chooses FRESH or INCREMENTAL (OPT_SCOPE) and prints the mode with its reason before any reviewer is launched.
+select_review_mode() {
+  local status=0 mode
+  if [ -z "$OPT_SCOPE" ] && [ "$OPT_RANGE_SET$OPT_MERGE_COMMIT_SET" != 00 ]; then
+    OPT_SCOPE=fresh
+    echo "gencr: review mode: FRESH — explicit --range/--merge-commit" >&2
+    return
+  fi
+  case "$OPT_SCOPE" in
+    "") mode=auto ;;
+    incremental) mode=incremental ;;
+    fresh) mode=fresh-check ;;
+  esac
+  previous_args "$mode"
+  support "${PREVIOUS_ARGS[@]}" || status=$?
+  case "$mode/$status" in
+    auto/0|incremental/0)
+      read_previous_fields
+      OPT_SCOPE=incremental
+      if [ "$PREVIOUS_OUTCOME" = "UNRESOLVED DISAGREEMENT" ]; then
+        echo "gencr: review mode: INCREMENTAL — continuing UNRESOLVED DISAGREEMENT review ${PREVIOUS_ID} (it used ${PREVIOUS_ROUNDS:-?} of ${MAX_ROUNDS} rounds; this run has its own limit of ${MAX_ROUNDS})" >&2
+      else
+        echo "gencr: review mode: INCREMENTAL — previous review ${PREVIOUS_ID} (reviewed $(short "$PREVIOUS_SHA"), ${PREVIOUS_OUTCOME})$([ "$mode" = auto ] && echo ", selected automatically")" >&2
+      fi
+      [ -z "$PREVIOUS_NEWER_UNRESOLVED" ] || echo "gencr: warning: the newer UNRESOLVED DISAGREEMENT review ${PREVIOUS_NEWER_UNRESOLVED} is not this run's baseline; its findings stay in its package" >&2 ;;
+    auto/3)
+      OPT_SCOPE=fresh
+      echo "gencr: review mode: FRESH — no compatible previous review ($(decision_message))" >&2 ;;
+    auto/4|incremental/4) no_new_review ;;
+    auto/5)
+      echo "gencr: $(decision_message)" >&2
+      exit 1 ;;
+    fresh-check/0)
+      confirm_fresh
+      echo "gencr: review mode: FRESH — requested with --fresh (previous review $(decision_message) not used as a baseline)" >&2 ;;
+    fresh-check/3) echo "gencr: review mode: FRESH — requested with --fresh" >&2 ;;
+    *) exit 1 ;;
+  esac
+}
+
+load_incremental_scope() {
+  read_previous_fields
   [ -n "$PREVIOUS_ID" ] && [ -n "$PREVIOUS_SHA" ] && [ -f "$PREVIOUS_PATH/full-report.md" ] \
     || die "cannot read the previous review selected for --incremental"
   PREVIOUS_OPEN_IDS="$(cat "$PREVIOUS_JSON.ids")"
@@ -507,7 +612,7 @@ load_incremental_scope() {
     fi
   done < "$PREVIOUS_JSON.files"
   [ "${#SCOPE_PATHS[@]}" -gt 0 ] || [ -n "$PREVIOUS_OPEN_IDS" ] \
-    || die "no changes since the previous review ${PREVIOUS_ID} and no open findings; nothing to review"
+    || die "no changes since the previous review ${PREVIOUS_ID} and no open findings; nothing to review (use --fresh to start over)"
   SCOPE_DIFF_FROM="$PREVIOUS_SHA"
   if [ "${#SCOPE_PATHS[@]}" -gt 0 ]; then
     SCOPE_DIFF="$(scoped_diff "$PREVIOUS_SHA" "${SCOPE_PATHS[@]}")" || die "cannot compute the incremental diff"
@@ -600,7 +705,7 @@ EOF
 EOF
   else
     cat <<EOF
-Review mode: INCREMENTAL (follow-up to review ${PREVIOUS_ID}, which reviewed ${PREVIOUS_SHA}):
+Review mode: INCREMENTAL (follow-up to review ${PREVIOUS_ID}, which reviewed ${PREVIOUS_SHA}; its verdict: ${PREVIOUS_OUTCOME}$( [ "$PREVIOUS_OUTCOME" != "UNRESOLVED DISAGREEMENT" ] || echo ", after ${PREVIOUS_ROUNDS:-?} of ${MAX_ROUNDS} reconciliation rounds; this run has its own limit of ${MAX_ROUNDS}")):
 - Examine the changes from ${PREVIOUS_SHA} to HEAD ${HEAD_SHA} and the files cited by the previous review's open findings.
 - Verify that every previously reported finding was actually corrected, look for regressions introduced by the corrections, and re-examine affected dependencies, callers and execution paths.
 - Unresolved previous findings remain open: carry each one forward with its original ID.
@@ -1235,6 +1340,8 @@ write_package() {
   state_put review_mode "$(echo "$OPT_SCOPE" | tr '[:lower:]' '[:upper:]')"
   state_put previous_id "${PREVIOUS_ID:-}"; state_put previous_sha "${PREVIOUS_SHA:-}"
   state_put previous_path "${PREVIOUS_PATH:-}"; state_put lineage "${LINEAGE_IDS:-}"
+  state_put previous_outcome "${PREVIOUS_OUTCOME:-}"; state_put previous_rounds "${PREVIOUS_ROUNDS:-}"
+  state_put previous_newer_unresolved "${PREVIOUS_NEWER_UNRESOLVED:-}"
   [ "$OPT_SCOPE" != incremental ] || state_put duplication duplication.json
   state_put instructions_version "$INSTRUCTIONS_VERSION"; state_put instructions_label "$INSTRUCTIONS_LABEL"
   state_put instructions_file "$INSTRUCTIONS_FILE"; state_put instructions_sha256 "$INSTRUCTIONS_SHA256"
@@ -1333,7 +1440,9 @@ run_review() {
   if [ -n "$INVOKE_ERROR" ]; then
     echo "gencr: error: ${INVOKE_ERROR}; the incomplete review was saved to ${RUN_DIR}" >&2
   else
-    echo "gencr: final verdict: ${OUTCOME}; report: ${RUN_DIR}/full-report.md" >&2
+    local mark=""
+    case "$OUTCOME" in APPROVED) mark="✅ " ;; "REQUEST CHANGES") mark="❌ " ;; esac
+    echo "gencr: final verdict: ${mark}${OUTCOME}; report: ${RUN_DIR}/full-report.md" >&2
   fi
   # In a subshell: a closed stdout (SIGPIPE or a write error) ends only the printing, never the review's exit status.
   (print_review_comment) || true
@@ -1370,6 +1479,7 @@ review_main() {
   WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/gencr.XXXXXX")" || die "cannot create a temporary directory"
   trap cleanup EXIT
   load_review_identity
+  select_review_mode
   if [ "$OPT_SCOPE" = incremental ]; then load_incremental_scope; else load_fresh_scope; fi
   print_scope
   if [ "$OPT_PRINT" -eq 1 ]; then

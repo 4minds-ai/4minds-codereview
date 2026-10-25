@@ -131,7 +131,7 @@ REMERGE="$(git -C "$R" commit-tree -p HEAD -p "$FEATURE" -m "redundant re-merge"
 git -C "$R" reset -q --hard "$REMERGE"
 publish
 git -C "$R" checkout -q feature
-run_in "$R" --print
+run_in "$R" --print --fresh
 check "redundant re-merge: the first introduction is found" \
   eval '[ "$STATUS" -eq 0 ] && contains "$ERR" "merge commit $(echo "$MERGE" | cut -c1-12)"'
 run_in "$R" --print --merge-commit="$REMERGE"
@@ -344,8 +344,8 @@ MOCK_VERDICT="REQUEST CHANGES" run_in "$R" --output-dir="$OUTDIR"
 FIRST="$(ls -td "$OUTDIR"/review-* | head -n 1)"
 check "historical FRESH with open findings (fixture)" eval '[ "$STATUS" -eq 10 ]'
 run_in "$R" --print --incremental --output-dir="$OUTDIR"
-check "same-head incremental after a merge-commit review verifies the open findings" \
-  eval '[ "$STATUS" -eq 0 ] && contains "$OUT" "Review mode: INCREMENTAL" && contains "$ERR" "anchor merge-commit (found)"'
+check "same-head incremental after a merge-commit review: that review covers HEAD, nothing new to review" \
+  eval '[ "$STATUS" -eq 0 ] && contains "$ERR" "no new review needed" && contains "$ERR" "(verdict REQUEST CHANGES)"'
 commit_file followup.py
 run_in "$R" --print --incremental --output-dir="$OUTDIR"
 check "branch advanced after the merge: refused as merge-commit evidence mismatch" \
@@ -377,6 +377,7 @@ manifest = json.load(open(manifest_path))
 manifest["files"]["metadata.json"] = hashlib.sha256(open(meta_path, "rb").read()).hexdigest()
 open(manifest_path, "w").write(json.dumps(manifest, indent=2))
 EOF
+commit_file leg2.py
 run_in "$R" --print --incremental --output-dir="$LEGACY_OUT"
 check "a legacy package without scope fields is still a merge-base baseline" \
   eval '[ "$STATUS" -eq 0 ] && contains "$OUT" "Review mode: INCREMENTAL"'
