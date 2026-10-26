@@ -509,6 +509,12 @@ decision_message() {
   sed -n 2p "$PREVIOUS_JSON.decision"
 }
 
+# A pinned --previous older than an UNRESOLVED DISAGREEMENT review of this branch: said on every path (new run or
+# no-op), so the unresolved review is never hidden.
+warn_newer_unresolved() {
+  [ -z "$PREVIOUS_NEWER_UNRESOLVED" ] || echo "gencr: warning: the newer UNRESOLVED DISAGREEMENT review ${PREVIOUS_NEWER_UNRESOLVED} is not this run's baseline; its findings stay in its package" >&2
+}
+
 # The previous review already covers HEAD: no reviewer is launched. With --output-dir (CI passes a new, empty one), a
 # no-review receipt records the decision for the CI adapter; it is written last and only into a directory that holds
 # no review package or receipt. Exits 0: "no new review needed", never an approval.
@@ -578,11 +584,14 @@ select_review_mode() {
       else
         echo "gencr: review mode: INCREMENTAL — previous review ${PREVIOUS_ID} (reviewed $(short "$PREVIOUS_SHA"), ${PREVIOUS_OUTCOME})$([ "$mode" = auto ] && echo ", selected automatically")" >&2
       fi
-      [ -z "$PREVIOUS_NEWER_UNRESOLVED" ] || echo "gencr: warning: the newer UNRESOLVED DISAGREEMENT review ${PREVIOUS_NEWER_UNRESOLVED} is not this run's baseline; its findings stay in its package" >&2 ;;
+      warn_newer_unresolved ;;
     auto/3)
       OPT_SCOPE=fresh
       echo "gencr: review mode: FRESH — no compatible previous review ($(decision_message))" >&2 ;;
-    auto/4|incremental/4) no_new_review ;;
+    auto/4|incremental/4)
+      read_previous_fields
+      warn_newer_unresolved
+      no_new_review ;;
     auto/5)
       echo "gencr: $(decision_message)" >&2
       exit 1 ;;

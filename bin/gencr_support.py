@@ -403,6 +403,48 @@ COMPLETED_OUTCOMES = ("APPROVED", "REQUEST CHANGES", "UNRESOLVED DISAGREEMENT")
 ISO_UTC_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
 
 
+def valid_utc(value):
+    """value if it is a calendar-valid UTC time as gencr writes it, else None."""
+    if not isinstance(value, str) or not ISO_UTC_RE.match(value):
+        return None
+    try:
+        datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+    return value
+
+
+def count(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def metadata_problem(metadata):
+    """Why a compatible package's own metadata cannot be trusted for selection, or None. Absent additive fields (older
+    schema-1 packages) are fine; present fields of the wrong type or value are not, and are never coerced."""
+    run_id = metadata.get("run_id")
+    if not isinstance(run_id, str) or not run_id or re.search(r"[\x00-\x1f\x7f/]", run_id):
+        return "its run ID is missing or invalid"
+    if not count(metadata.get("rounds", 0)):
+        return "its round count is not a non-negative integer"
+    previous = metadata.get("previous_review")
+    if previous is None:
+        return None
+    if not isinstance(previous, dict):
+        return "its previous_review is not an object"
+    sha = previous.get("reviewed_sha")
+    if not isinstance(previous.get("id"), str) or not previous["id"] or not isinstance(sha, str) \
+            or not re.match(r"^[0-9a-f]{40}$", sha) or not isinstance(previous.get("path"), (str, type(None))):
+        return "its previous_review identity is invalid"
+    if "outcome" in previous and previous["outcome"] not in COMPLETED_OUTCOMES:
+        return "its previous_review outcome is invalid"
+    if "rounds_used" in previous and not count(previous["rounds_used"]):
+        return "its previous_review rounds_used is not a non-negative integer"
+    if "newer_unresolved" in previous and (not isinstance(previous["newer_unresolved"], str)
+                                           or not previous["newer_unresolved"].strip()):
+        return "its previous_review newer_unresolved is invalid"
+    return None
+
+
 def evaluate_previous(candidate, args):
     """A candidate package checked against the current review identity: (record, None) or (None, reason). Every
     failure, including valid JSON of the wrong shape, is a rejection reason; nothing here aborts discovery."""
@@ -438,12 +480,17 @@ def evaluate_previous(candidate, args):
         open_findings = findings.get("final_findings") or []
         if not isinstance(open_findings, list) or not all(isinstance(f, dict) for f in open_findings):
             raise ValueError("findings.json final_findings is not a list of findings")
-        completed_at = metadata.get("completed_at")
-        rounds = metadata.get("rounds", 0)
-        return {"path": run_dir, "metadata": metadata, "findings": findings, "id": metadata.get("run_id"),
+        # A compatible review on HEAD's history with untrustworthy metadata stays in the history (it may be the
+        # latest review, e.g. an UNRESOLVED barrier) but can never be selected: "invalid" stops the selection.
+        try:
+            invalid = metadata_problem(metadata)
+        except Exception as error:  # never the candidate-drop path below: an unvalidatable package stays a barrier
+            invalid = "its metadata could not be validated (%s)" % type(error).__name__
+        return {"path": run_dir, "metadata": metadata, "findings": findings,
+                "id": metadata.get("run_id") if not invalid else os.path.basename(run_dir.rstrip("/")),
                 "reviewed_sha": reviewed, "outcome": outcome, "open_findings": open_findings,
-                "completed_at": completed_at if isinstance(completed_at, str) and ISO_UTC_RE.match(completed_at)
-                else None, "rounds": rounds if isinstance(rounds, int) else None}, None
+                "completed_at": valid_utc(metadata.get("completed_at")),
+                "rounds": None if invalid else metadata.get("rounds", 0), "invalid": invalid}, None
     except (ValueError, OSError, TypeError, AttributeError, KeyError) as error:
         return None, "%s: %s" % (os.path.basename(candidate.rstrip("/")), error)
 
@@ -451,8 +498,8 @@ def evaluate_previous(candidate, args):
 def review_frontier(records, repo):
     """(frontier, ambiguous): the completed reviews furthest along HEAD's history. A review whose reviewed commit is
     a proper ancestor of another's is superseded; several reviews of one commit are ordered by their validated
-    completion time, and a tie or a missing time is ambiguous. Several distinct commits on the frontier (a merge DAG)
-    are ambiguous too: gencr never guesses."""
+    completion time, and a missing time or a tie for the latest is ambiguous (a tie among older reviews is not).
+    Several distinct commits on the frontier (a merge DAG) are ambiguous too: gencr never guesses."""
     by_sha = {}
     for record in records:
         by_sha.setdefault(record["reviewed_sha"], []).append(record)
@@ -463,7 +510,7 @@ def review_frontier(records, repo):
         group = by_sha[sha]
         if len(group) > 1:
             times = [r["completed_at"] for r in group]
-            if None in times or len(set(times)) != len(times):
+            if None in times or times.count(max(times)) > 1:
                 ambiguous = True
                 frontier += group
                 continue
@@ -543,6 +590,8 @@ def cmd_previous(args):
                  "No reviewer was launched.")
     if args.previous:
         chosen, reason = evaluate_previous(os.path.realpath(args.previous), args)
+        if chosen and chosen["invalid"]:
+            chosen, reason = None, "%s: %s" % (chosen["id"], chosen["invalid"])
         if not chosen:
             die("cannot use %s as the incremental baseline (%s). Run with --fresh instead." % (args.previous, reason))
         newer = [r for r in scanned if r["outcome"] == "UNRESOLVED DISAGREEMENT" and r["path"] != chosen["path"]
@@ -557,6 +606,13 @@ def cmd_previous(args):
                 return decide("none", detail, 3)
             detail = "; ".join(reasons[-5:]) if reasons else "no previous review packages found in %s" % args.search_dir
             die("cannot establish a reliable incremental baseline (%s). Run with --fresh instead." % detail)
+        untrusted = [r for r in frontier if r["invalid"]]
+        if untrusted:
+            message = ("the latest previous review cannot be trusted as a baseline: %s. %s"
+                       % ("; ".join("%s at %s (%s)" % (r["id"], r["path"], r["invalid"]) for r in untrusted), stop_hint))
+            if args.mode == "auto":
+                return decide("invalid", message, 5)
+            die(message)
         if ambiguous:
             listing = "; ".join(describe(r) + " at " + r["path"] for r in frontier)
             message = ("several previous reviews could be the baseline and none is unambiguously the latest: %s. %s"

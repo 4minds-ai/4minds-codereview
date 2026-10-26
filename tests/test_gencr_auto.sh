@@ -252,9 +252,22 @@ check "two reviews of one commit with the same completion time: stop, list both,
   eval '[ "$STATUS" -eq 1 ] && [ "$(calls)" -eq 0 ] && contains "$ERR" "none is unambiguously the latest" && contains "$ERR" "$(run_id "$A")" && contains "$ERR" "twin" &&
         contains "$ERR" "--incremental --previous=<package>" && contains "$ERR" "--fresh"'
 retouch "$(reports dev10)/review-twin" 'm["completed_at"] = "2031-01-01T00:00:00Z"'
+# An older tie (two reviews completed in the same second) does not hide a unique latest review.
+cp -R "$A" "$(reports dev10)/review-twin2"
+retouch "$(reports dev10)/review-twin2" 'm["run_id"] = "twin2"'
 review APPROVED dev10
 check "two reviews of one commit: the later validated completion time decides" \
   eval '[ "$STATUS" -eq 0 ] && contains "$ERR" "INCREMENTAL — previous review twin"'
+# Two reviews of one commit, one without a valid completion time: they cannot be ordered.
+review APPROVED dev10m
+M1="$(newest dev10m)"
+cp -R "$M1" "$(reports dev10m)/review-untimed"
+retouch "$(reports dev10m)/review-untimed" 'm["run_id"] = "untimed"; m["completed_at"] = "yesterday"'
+retouch "$M1" 'm["completed_at"] = "2030-01-01T00:00:00Z"'
+commit c8m
+review APPROVED dev10m
+check "two reviews of one commit, one with an invalid completion time: stop, launch nothing" \
+  eval '[ "$STATUS" -eq 1 ] && [ "$(calls)" -eq 0 ] && contains "$ERR" "none is unambiguously the latest" && contains "$ERR" "untimed"'
 # A merge DAG: two reviewed commits on the branch, neither an ancestor of the other, both in HEAD's history.
 git -C "$TARGET" tag pre-dag
 commit_file left
@@ -305,6 +318,98 @@ review APPROVED dev12 --incremental --previous="$OLDER"
 check "--previous=<older> across a newer UNRESOLVED: runs from the chosen one, warns and records the newer review" \
   eval '[ "$STATUS" -eq 0 ] && contains "$ERR" "previous review $(run_id "$OLDER")" && contains "$ERR" "warning: the newer UNRESOLVED DISAGREEMENT review $(run_id "$NEWER")" &&
         [ "$(json_get "$(newest dev12)/metadata.json" "d[\"previous_review\"][\"newer_unresolved\"]")" = "$(run_id "$NEWER")" ]'
+# A pinned older review that already covers HEAD: the no-op still discloses the newer UNRESOLVED review.
+review APPROVED devpin
+PIN="$(newest devpin)"
+cp -R "$PIN" "$(reports devpin)/review-unres2"
+retouch "$PIN" 'm["completed_at"] = "2030-01-01T00:00:00Z"'
+retouch "$(reports devpin)/review-unres2" 'm["run_id"] = "unres2"; m["outcome"] = "UNRESOLVED DISAGREEMENT"; m["rounds"] = 3; m["completed_at"] = "2031-01-01T00:00:00Z"'
+for extra in "" --print; do
+  review APPROVED devpin --incremental --previous="$PIN" $extra
+  check "--previous=<older> that covers HEAD${extra:+ ($extra)}: no-op, and it still warns about the newer UNRESOLVED review" \
+    eval '[ "$STATUS" -eq 0 ] && [ "$(calls)" -eq 0 ] && contains "$ERR" "no new review needed" && contains "$ERR" "warning: the newer UNRESOLVED DISAGREEMENT review unres2"'
+done
+
+# ── 4b. Metadata that cannot be trusted stops the selection (never coerced, never dropped) ──
+
+untrusted() { # DEV DESCRIPTION PYTHON-EDIT — the only review covers HEAD, but its metadata is invalid
+  review APPROVED "$1"
+  local pkg; pkg="$(newest "$1")"
+  retouch "$pkg" "$3"
+  review APPROVED "$1"
+  check "untrusted metadata ($2): automatic selection stops, launches nothing, names the package" \
+    eval '[ "$STATUS" -eq 1 ] && [ "$(calls)" -eq 0 ] && contains "$ERR" "cannot be trusted as a baseline" && contains "$ERR" "$(basename "$pkg")" &&
+          ! contains "$ERR" "review None" && ! contains "$ERR" "no new review needed"'
+  review APPROVED "$1" --incremental
+  check "untrusted metadata ($2): explicit --incremental stops too" \
+    eval '[ "$STATUS" -eq 1 ] && [ "$(calls)" -eq 0 ] && contains "$ERR" "cannot be trusted as a baseline"'
+  review APPROVED "$1" --incremental --previous="$pkg"
+  check "untrusted metadata ($2): it cannot be pinned with --previous" \
+    eval '[ "$STATUS" -eq 1 ] && [ "$(calls)" -eq 0 ] && contains "$ERR" "cannot use" && contains "$ERR" "Run with --fresh instead"'
+}
+untrusted devu1 "run ID null" 'm["run_id"] = None'
+untrusted devu2 "rounds not a number" 'm["rounds"] = "broken"'
+untrusted devu3 "negative rounds" 'm["rounds"] = -1'
+untrusted devu4 "previous_review fields of the wrong type" \
+  'm["previous_review"] = {"id": "p", "reviewed_sha": "a" * 40, "path": None, "rounds_used": [], "outcome": 42, "newer_unresolved": ["invalid"]}'
+untrusted devu5 "previous_review not an object" 'm["previous_review"] = "p"'
+n=6
+for sha in 123 True '["a"]' '{"sha": "a"}'; do
+  untrusted "devu$n" "previous_review reviewed_sha $sha" "m[\"previous_review\"] = {\"id\": \"earlier-review\", \"reviewed_sha\": $sha, \"path\": None}"
+  review APPROVED "devu$n"
+  check "untrusted metadata (previous_review reviewed_sha $sha): the specific reason is given" \
+    eval 'contains "$ERR" "its previous_review identity is invalid"'
+  n=$((n + 1))
+done
+# A malformed newer UNRESOLVED review keeps its place in the history: it is never skipped for an older APPROVED one,
+# and on its own it never turns into an automatic FRESH restart.
+review APPROVED devbar
+BOLD="$(newest devbar)"
+cp -R "$BOLD" "$(reports devbar)/review-newer-unresolved"
+retouch "$BOLD" 'm["completed_at"] = "2026-10-25T12:00:00Z"'
+retouch "$(reports devbar)/review-newer-unresolved" 'm["run_id"] = "newer-unresolved"; m["outcome"] = "UNRESOLVED DISAGREEMENT"; m["completed_at"] = "2026-10-25T13:00:00Z"
+m["previous_review"] = {"id": "earlier-review", "reviewed_sha": 123, "path": None}'
+review APPROVED devbar
+check "an older APPROVED behind a malformed newer UNRESOLVED (same commit): automatic mode stops, never covered by the older" \
+  eval '[ "$STATUS" -eq 1 ] && [ "$(calls)" -eq 0 ] && contains "$ERR" "cannot be trusted as a baseline" && contains "$ERR" "review-newer-unresolved" && ! contains "$ERR" "no new review needed"'
+review APPROVED devbar --incremental
+check "... explicit --incremental without --previous stops too (never silently the older package)" \
+  eval '[ "$STATUS" -eq 1 ] && [ "$(calls)" -eq 0 ] && contains "$ERR" "cannot be trusted as a baseline"'
+review APPROVED devbar --incremental --previous="$BOLD"
+check "... pinning the older APPROVED is a no-op that still warns about the newer UNRESOLVED review" \
+  eval '[ "$STATUS" -eq 0 ] && [ "$(calls)" -eq 0 ] && contains "$ERR" "warning: the newer UNRESOLVED DISAGREEMENT review review-newer-unresolved"'
+review APPROVED devbar --incremental --previous="$(reports devbar)/review-newer-unresolved"
+check "... and the malformed UNRESOLVED package itself cannot be pinned" \
+  eval '[ "$STATUS" -eq 1 ] && [ "$(calls)" -eq 0 ] && contains "$ERR" "cannot use"'
+rm -r "${BOLD:?}"
+review APPROVED devbar
+check "a malformed UNRESOLVED package alone: automatic mode stops; it never restarts FRESH" \
+  eval '[ "$STATUS" -eq 1 ] && [ "$(calls)" -eq 0 ] && contains "$ERR" "cannot be trusted as a baseline" && ! contains "$ERR" "review mode: FRESH"'
+# A completion time that matches the format but is no date cannot order reviews of one commit (no covered no-op).
+review "REQUEST CHANGES" devdate
+DPKG="$(newest devdate)"
+cp -R "$DPKG" "$(reports devdate)/review-unres3"
+retouch "$(reports devdate)/review-unres3" 'm["run_id"] = "unres3"; m["outcome"] = "UNRESOLVED DISAGREEMENT"; m["completed_at"] = "2026-10-25T12:00:00Z"'
+retouch "$DPKG" 'm["outcome"] = "APPROVED"; m["completed_at"] = "2026-99-99T99:99:99Z"'
+review APPROVED devdate
+check "an impossible completion date never outranks an UNRESOLVED review of the same commit: stop, launch nothing" \
+  eval '[ "$STATUS" -eq 1 ] && [ "$(calls)" -eq 0 ] && contains "$ERR" "none is unambiguously the latest" && contains "$ERR" "unres3" && ! contains "$ERR" "no new review needed"'
+review APPROVED devdate --incremental
+check "an impossible completion date with explicit --incremental: stop as well" \
+  eval '[ "$STATUS" -eq 1 ] && [ "$(calls)" -eq 0 ] && contains "$ERR" "none is unambiguously the latest"'
+# Control: a valid older package without the additive fields (rounds, previous_review outcome/rounds_used) is a baseline.
+review APPROVED devold
+commit c10b
+review APPROVED devold
+OLDPKG="$(newest devold)"
+retouch "$OLDPKG" 'del m["rounds"]; [m["previous_review"].pop(k, None) for k in ("outcome", "rounds_used", "newer_unresolved")]'
+review APPROVED devold
+check "a valid package written before the additive fields still covers HEAD (no-op, not refused)" \
+  eval '[ "$STATUS" -eq 0 ] && [ "$(calls)" -eq 0 ] && contains "$ERR" "no new review needed: review $(run_id "$OLDPKG")"'
+commit c10c
+review APPROVED devold
+check "... and is the automatic INCREMENTAL baseline after a new commit" \
+  eval '[ "$STATUS" -eq 0 ] && contains "$ERR" "INCREMENTAL — previous review $(run_id "$OLDPKG")"'
 
 # ── 5. Explicit --fresh: full PR scope, previous ignored, confirmation only on a terminal ──
 
