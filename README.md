@@ -8,7 +8,7 @@ AI-assisted code review using Claude Code. Generates structured, checklist-drive
 - [Claude Code CLI](https://claude.ai/code) — must be installed and authenticated (`claude --version` should work)
 - [Codex CLI](https://developers.openai.com/codex/cli) for Codex or adversarial reviews (`codex --version`)
 - bash (macOS's bash 3.2 works) and python3 3.8 or newer (standard library only) for headless reviews
-- zsh (standard on macOS) for the `gencrnew` shell function
+- zsh (standard on macOS) for the `gencrclaude` shell function
 
 `gencr` runs the same way on macOS and Linux. It uses the CLIs' existing authentication (for example Amazon Bedrock
 configured in `~/.claude/settings.json` and `~/.codex/config.toml`); it never needs GitHub credentials locally.
@@ -51,57 +51,79 @@ export CODEREVIEW_BASE_BRANCH=main
 
 ## Usage
 
-### From the terminal (recommended)
+### Reviews (`gencr`)
 
-Run this from inside any git repo:
+Run this from inside any git repository (with the branch to review checked out):
 
 ```bash
-gencrnew <dev-username>
+gencr <dev-username>
 ```
 
-Example:
+`gencr swalker` runs a headless review with the new review engine: Claude reviews (the default reviewer), read-only,
+and `gencr` writes the complete review package and consolidated Markdown report, prints a GitHub-ready review comment
+and exits with the outcome. It decides the scope automatically and says so before any reviewer starts
+(`gencr: review mode: ...`):
 
-```bash
-gencrnew swalker
+- no compatible earlier review of this branch in the output directory: FRESH (the complete pull request);
+- otherwise INCREMENTAL from the latest compatible completed review (APPROVED or REQUEST CHANGES): same repository,
+  developer, pull request, branch, base, instructions, scope and merge-base, an intact package, and a reviewed commit
+  that is in HEAD's history. Reviews are ordered by commit history, never by timestamp alone;
+- that review already covers HEAD: no reviewer is launched; `gencr` prints the review's ID, commit and verdict and exits
+  `0` ("no new review needed" — not an approval);
+- the latest review ended UNRESOLVED DISAGREEMENT, several reviews could be the baseline and none is unambiguously the
+  latest (for reviews of one commit: a missing or invalid completion time, or two sharing the latest one), or the latest
+  review's own metadata is invalid: `gencr` stops before any reviewer (exit `1`), lists them, and asks you to add
+  `--incremental` (optionally `--previous=<package>`) or `--fresh`. A package with invalid metadata is never coerced into
+  a baseline, skipped in favour of an older review, or accepted as `--previous`.
+
+`--incremental` requires a compatible previous review and never falls back to FRESH; it may continue an UNRESOLVED
+DISAGREEMENT review (also at the same HEAD), with its own limit of three reconciliation rounds — the previous review's
+ID, verdict and rounds are stated and recorded. `--fresh` always starts a complete new review and deletes nothing; when
+an earlier review exists and you are at a terminal it asks first:
+
+```
+Previous code review detected for this branch.
+
+A FRESH review will start over and ignore the previous review as its baseline.
+
+Continue with FRESH? [Y/n] (15 seconds; default Y)
 ```
 
-This launches Claude Code with a fully constructed review prompt. Claude will:
-1. Identify only the files touched by commits made directly on the current branch (merge commits are excluded)
-2. Run through the checklist in `~/.claude/CODE_REVIEW.md`
-3. Check for a prior review of the same branch and summarize what changed since then
-4. Save the report to `~/Documents/CodeReview/<dev-username>/code-review-<dev>-<branch>-<timestamp>.md`
+Enter or `y` continues, `n` cancels (exit `1`, no reviewer launched), no answer within 15 seconds continues FRESH, and
+an invalid answer asks again within the same 15 seconds. The question is read from the controlling terminal (never from
+standard input) and is never asked without a terminal or with `--print`.
 
-`gencrnew` is a thin wrapper around `gencr <dev-username> --claude=review --interactive`: it opens the same interactive
-Claude session with the same prompt as before, and accepts extra options such as `gencrnew swalker --version=2`.
+### The original Claude workflow (`gencrclaude`)
 
-### Headless reviews (`gencr`)
+`gencrclaude <dev-username>` (from `dotfiles/zsh/codereview.zsh`) is the original Claude-only review: it opens an
+interactive Claude session with the original prompt and old report format, and never runs Codex or `bin/gencr`.
 
-`gencr <dev-username>` with no options prints the legacy one-line prompt, as before. With options, `gencr` runs the
-review headless: the reviewer CLIs run non-interactively and read-only, and `gencr` writes a standard report package and
-exits with the outcome.
+### Options
 
 ```bash
-gencr swalker --version=2                             # Claude reviews (fresh) with CODE_REVIEW_VERSION_2.md (-v=2 also works)
+gencr swalker --version=2                             # Claude reviews with CODE_REVIEW_VERSION_2.md (-v=2 also works)
 gencr swalker --codex=review                          # Codex reviews (default instructions)
 gencr swalker -v=2 --codex=attack                     # Claude reviews first; Codex attacks Claude's findings
 gencr swalker -v=2 --codex=review --claude=attack     # Codex reviews first; Claude attacks Codex's findings
 gencr swalker -v=2 --codex=attack --claude-model=opus --codex-model gpt-5.6
-gencr swalker -v=2 --codex=attack --incremental       # follow-up to the newest compatible previous review
+gencr swalker -v=2 --codex=attack --fresh             # start over (asks first when an earlier review exists)
+gencr swalker -v=2 --codex=attack --incremental       # follow-up to the latest compatible previous review
 gencr swalker -v=2 --range=1a2b3c4..9f8e7d6           # fresh review of exactly these commits (HEAD = 9f8e7d6)
-gencr swalker --interactive                           # interactive Claude session (what gencrnew runs)
 gencr swalker -v=2 --codex=attack --print             # print the first reviewer's exact prompt; launch nothing
 gencr --help
 ```
 
 - Instructions: `--version=N` / `-v=N` selects `dotfiles/claude/CODE_REVIEW_VERSION_N.md` in this repository; without it,
   `CODE_REVIEW.md` is used. A missing version is an error, never a fallback.
-- Scope: `--fresh` (the default) reviews the complete pull request difference, from the merge-base with
+- Scope: FRESH reviews the complete pull request difference, from the merge-base with
   `origin/$CODEREVIEW_BASE_BRANCH` to HEAD, including changes brought in by merging other branches, renames and
   deletions; reviewers may read surrounding code. `--incremental` reviews the changes since a previous review package and
   requires every previous finding to be verified (`fixed`, `not fixed` or `obsolete`); unfixed findings are carried
   forward. Incremental reviews refuse a baseline from another repository, branch, base, pull request
   (`--pr-number`), instruction version, a different merge-base, a rewritten history, an incomplete package or a
-  failed run, and tell you to run `--fresh`. An incremental approval covers only the incremental changes.
+  failed run, and tell you to run `--fresh`. An incremental approval covers only the incremental changes. Earlier review
+  packages without newer optional fields (review notes, value layouts, previous-review details) stay usable as baselines;
+  `gencrclaude` reports are never review packages.
 - Merged branches: before any reviewer starts, `gencr` prints how it resolved the scope
   (`gencr: review scope: FRESH, method ..., target ..., base ..., head ...`). Check out the branch head to review it:
   - Open branch, or a squash/rebase-merged branch whose head is not in the base: method `merge-base`, target
@@ -196,9 +218,13 @@ limited to 40,000 characters: if the merge blockers do not all fit, it states th
 many more there are (with their IDs when they fit); the complete report and `findings.json` always have all of them.
 Set `GENCR_REVIEW_COMMENT=off` to print a one-line result instead (the CI workflow does).
 
-Exit status: `0` APPROVED, `10` REQUEST CHANGES, `11` UNRESOLVED DISAGREEMENT, `20` INCOMPLETE (invalid report, missing
+The terminal's final line marks the verdict (`gencr: final verdict: ✅ APPROVED` / `❌ REQUEST CHANGES`); the verdict
+tokens in reports, `findings.json`, metadata and the review comment are unchanged.
+
+Exit status: `0` APPROVED (or no new review needed: the previous review already covers HEAD), `10` REQUEST CHANGES, `11` UNRESOLVED DISAGREEMENT, `20` INCOMPLETE (invalid report, missing
 prompt part, repository changed), `21` reviewer failure (CLI error, empty report, model selection failure), `22` timeout,
-`23` the report could not be saved, `2` usage error, `1` other errors.
+`23` the report could not be saved, `2` usage error, `1` other errors (including a declined FRESH confirmation and a review
+mode that needs your decision).
 
 ### Tests
 
@@ -212,6 +238,8 @@ bash tests/test_gencr_summary.sh # GitHub-ready review comment (terminal and PR 
 bash tests/test_gencr_peer.sh  # peer-finding ownership and references (replays a real failed reconciliation)
 bash tests/test_gencr_notes.sh # review notes and disputed rows (replays a real misplaced-observations failure)
 bash tests/test_gencr_values.sh # field values: inline, block, fences and reserved lines (replays a real failure)
+bash tests/test_gencr_auto.sh   # automatic FRESH/INCREMENTAL selection and the --fresh confirmation (pseudo-terminal)
+bash tests/test_gencrclaude.sh  # gencrclaude: the original Claude workflow, independent of gencr
 bash tests/run_ubuntu.sh      # all suites in a clean Ubuntu container (needs Docker)
 ```
 
@@ -236,6 +264,19 @@ tests, not code reviews; a mock result is never accepted as the baseline of a re
 review comment from `summary.md` plus the artifact link; artifacts expire after the retention period and are not
 permanent PR attachments. No report is ever committed. `.github/workflows/gencr-tests.yml` runs the test suites on
 Ubuntu and macOS without secrets.
+
+Draft pull requests are never reviewed. As soon as the pull request is resolved, and before any other review
+preparation (checkout, scope, previous review), `gencr-ci eligibility` reads the live pull request: it must be ready for
+review (a boolean `draft: false`) at the resolved head, open (or merged, for a historical review) with consistent
+`state`/`merged` values, and the event must be a manual run or `ready_for_review`. Every later preparation step runs only
+for an eligible pull request, so a draft is skipped even when, say, its incremental baseline is missing. During the review the engine asks a CI-only eligibility broker (which alone holds the job's
+read-only token) immediately before EVERY reviewer launch, so a pull request converted to a draft mid-review gets no
+further reviewer. A confirmed draft or ineligible event is a skip: nothing is published and earlier comments and statuses
+stay as they are. Missing, stale or ambiguous information fails closed as an infrastructure error, never an approval. A
+"no new review needed" result likewise publishes nothing. Reviewer processes never receive `GH_TOKEN` or the broker
+socket. Limits: a check-to-launch race of milliseconds remains, and the broker's token is readable by same-user processes
+on Linux — part of the credential-isolation prerequisite below. The workflow's trigger stays manual-only; no
+`pull_request` trigger is enabled.
 
 Paid reviews are disabled: the only reviewer backend is `mock`. Enabling real Claude and Codex reviews in CI requires a
 DevOps-provisioned organization-owned CI identity with validated Bedrock access for both CLIs, a credential-isolation
@@ -286,7 +327,7 @@ These are enforced regardless of PR size or context:
 ~/src/codereview/
 ├── setup.sh                              # Symlinks dotfiles, checks prerequisites
 ├── bin/
-│   ├── gencr                             # Legacy prompt; headless and interactive reviews
+│   ├── gencr                             # Headless reviews: automatic FRESH/INCREMENTAL, single or adversarial
 │   ├── gencr_support.py                  # Reviewer invocation, previous-review lookup, report packages
 │   ├── gencr_duplicates.py               # Incremental duplication pre-search and validation
 │   └── gencr-ci                          # GitHub Actions adapter (gate, PR context, artifact, PR comment)
@@ -294,24 +335,27 @@ These are enforced regardless of PR size or context:
 │   ├── gencr-review.yml                  # Manual PR review (mock reviewers only)
 │   └── gencr-tests.yml                   # Test suites on Ubuntu and macOS
 ├── tests/
-│   ├── test_gencr.sh                     # gencr/gencrnew tests with mock CLIs
+│   ├── test_gencr.sh                     # gencr engine tests with mock CLIs
 │   ├── test_gencr_ci.sh                  # gencr-ci and workflow tests with a mock gh API
 │   ├── test_gencr_dup.sh                 # Incremental duplication check tests
 │   ├── test_gencr_peer.sh                # Peer-finding ownership and reference tests
 │   ├── test_gencr_notes.sh               # Review notes and disputed-row tests
 │   ├── test_gencr_values.sh              # Field-value grammar tests (blocks, fences, reserved lines)
-│   ├── run_ubuntu.sh                     # Runs both suites in Docker (Ubuntu)
+│   ├── test_gencr_auto.sh                # Automatic review-mode and --fresh confirmation tests
+│   ├── test_gencrclaude.sh               # gencrclaude (original Claude workflow) tests
+│   ├── workflow_sim.py                   # Runs gencr-review.yml locally, step by step (for test_gencr_ci.sh)
+│   ├── run_ubuntu.sh                     # Runs every suite in Docker (Ubuntu)
 │   ├── mocks/                            # Mock claude, codex and gh CLIs
-│   └── fixtures/                         # Previous gencrnew; sanitized replay of a failed reconciliation
+│   └── fixtures/                         # Original gencrclaude function; sanitized replays of failed reviews
 └── dotfiles/
     ├── claude/
     │   ├── CODE_REVIEW.md                # The review checklist
     │   ├── CODE_REVIEW_VERSION_<N>.md    # Versioned checklists (gencr --version=N)
-    │   ├── code_review_query.md          # Legacy prompt template (plain gencr)
+    │   ├── code_review_query.md          # Prompt template linked by setup.sh (not used by gencr)
     │   └── commands/
     │       └── code-review.md            # /project:code-review slash command
     └── zsh/
-        └── codereview.zsh                # gencrnew() wrapper around gencr
+        └── codereview.zsh                # gencrclaude(): the original Claude review workflow
 ```
 
 ## Troubleshooting
@@ -320,7 +364,7 @@ These are enforced regardless of PR size or context:
 Install Claude Code CLI: https://claude.ai/code
 
 **`Error: not in a git repo`**
-Run `gencrnew` from inside a git repository.
+Run `gencr` or `gencrclaude` from inside a git repository.
 
 **Review includes files from staging or other merged branches**
 This should not happen — Claude is instructed to use `git log --no-merges --ancestry-path` scoped to your branch. If it does, re-run and paste the file list back to Claude with: *"these files are out of scope, only review files from non-merge commits on this branch"*.
