@@ -1183,10 +1183,13 @@ invoke_reviewer() {
   [ -z "$model" ] || args=("${args[@]}" --model "$model")
   [ -z "$OPT_TIMEOUT" ] || args=("${args[@]}" --timeout "$OPT_TIMEOUT")
   support invoke --agent "$agent" --prompt "$2" --report "$3" --log "$4.log" --raw "$4.raw.json" \
-    --meta "$4.invoke.json" --repo "$REPO_ROOT" --add-dir "$REPORT_DIR" "${args[@]}" 2> "$4.err" || status=$?
+    --meta "$4.invoke.json" --repo "$REPO_ROOT" --add-dir "$REPORT_DIR" "${args[@]}" \
+    --eligibility-pr "$OPT_PR" --eligibility-sha "$HEAD_SHA" 2> "$4.err" || status=$?
   case "$status" in
     0) return 0 ;;
     22) FAIL_OUTCOME="TIMEOUT" ;;
+    30) FAIL_OUTCOME="INCOMPLETE" ELIGIBILITY=ineligible ;;  # CI: the pull request became a draft / ineligible
+    31) FAIL_OUTCOME="INCOMPLETE" ELIGIBILITY=unknown ;;     # CI: eligibility could not be verified
     *) FAIL_OUTCOME="REVIEWER FAILURE" ;;
   esac
   INVOKE_ERROR="$(tail -n 1 "$4.err") (see $4.log)"
@@ -1316,7 +1319,7 @@ call_reviewer() {
 }
 
 reset_review_state() {
-  STEP=0 ROUND=0 LAST_VERDICT_claude="" LAST_VERDICT_codex="" LAST_AGREEMENT="" INVOKE_ERROR="" FAIL_OUTCOME=""
+  ELIGIBILITY="" STEP=0 ROUND=0 LAST_VERDICT_claude="" LAST_VERDICT_codex="" LAST_AGREEMENT="" INVOKE_ERROR="" FAIL_OUTCOME=""
   PRIMARY_REPORT_ID="" ADVERSARY_REPORT_ID="" REPORT_IDS=() REPORT_LABELS=() INVOCATIONS=()
 }
 
@@ -1351,6 +1354,7 @@ write_package() {
   state_put previous_path "${PREVIOUS_PATH:-}"; state_put lineage "${LINEAGE_IDS:-}"
   state_put previous_outcome "${PREVIOUS_OUTCOME:-}"; state_put previous_rounds "${PREVIOUS_ROUNDS:-}"
   state_put previous_newer_unresolved "${PREVIOUS_NEWER_UNRESOLVED:-}"
+  state_put eligibility "${ELIGIBILITY:-}"
   [ "$OPT_SCOPE" != incremental ] || state_put duplication duplication.json
   state_put instructions_version "$INSTRUCTIONS_VERSION"; state_put instructions_label "$INSTRUCTIONS_LABEL"
   state_put instructions_file "$INSTRUCTIONS_FILE"; state_put instructions_sha256 "$INSTRUCTIONS_SHA256"

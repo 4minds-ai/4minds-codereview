@@ -1068,7 +1068,11 @@ GITHUB_ACTIONS=true GITHUB_TOKEN=ghs_canary GH_TOKEN=ghs_canary GITHUB_REPOSITOR
 check "local runs never call gh or GitHub, even with GitHub variables set" \
   eval '[ "$STATUS" -eq 0 ] && [ "$(calls)" -eq 1 ] && [ -f "$(pkg localci)/manifest.json" ] && [ ! -e "$MOCK_STATE/gh-calls" ]'
 check "the review engine contains no GitHub API or gh usage" \
-  eval '! grep -nE "api\.github\.com|(^|[^a-z_])gh (api|pr|run)|GITHUB_" "$TREE/bin/gencr" "$TREE/bin/gencr_support.py"'
+  eval '! grep -nE "api\.github\.com|(^|[^a-z_])gh (api|pr|run)|GITHUB_" "$TREE/bin/gencr" "$TREE/bin/gencr_support.py" |
+    grep -vE "^[^:]+:[0-9]+:REVIEWER_ENV_DENY = \(\"GH_TOKEN\", \"GITHUB_TOKEN\", \"GENCR_ELIGIBILITY_SOCKET\"\)$"'
+# The one exempt line only removes tokens from reviewer processes; it must stay exactly that list.
+check "the engine names GitHub tokens only to remove them from reviewer processes" \
+  eval '[ "$(grep -c "REVIEWER_ENV_DENY" "$TREE/bin/gencr_support.py")" -eq 2 ] && grep -q "if key not in REVIEWER_ENV_DENY and not key.startswith(\"GENCR_ELIGIBILITY_\")}" "$TREE/bin/gencr_support.py"'
 
 check "no generated report or artifact is ever written inside the reviewed repository" \
   eval '[ -z "$(git -C "$TARGET" status --porcelain --untracked-files=all --ignored)" ]'

@@ -110,6 +110,39 @@ def kill_group(proc):
             continue
 
 
+ELIGIBILITY_DISPOSITIONS = ("ELIGIBLE", "INELIGIBLE", "UNKNOWN")
+# Never passed to a reviewer process: GitHub credentials and the CI eligibility channel.
+REVIEWER_ENV_DENY = ("GH_TOKEN", "GITHUB_TOKEN", "GENCR_ELIGIBILITY_SOCKET")
+
+
+def check_eligibility(pr_number, head_sha):
+    """(disposition, reason) for launching a reviewer now. Only in CI, where the workflow sets GENCR_ELIGIBILITY_SOCKET
+    to its eligibility broker (which holds the GitHub token): one bounded request per launch, never cached; any error
+    is UNKNOWN. Locally the variable is unset: no check and no GitHub access."""
+    path = os.environ.get("GENCR_ELIGIBILITY_SOCKET")
+    if not path:
+        return "ELIGIBLE", None
+    import socket
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(20)
+            conn.connect(path)
+            conn.sendall((json.dumps({"pr_number": pr_number, "head_sha": head_sha}) + "\n").encode())
+            reply = b""
+            while not reply.endswith(b"\n") and len(reply) <= 4096:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                reply += chunk
+        answer = json.loads(reply.decode("utf-8")) if len(reply) <= 4096 else None
+    except (OSError, ValueError) as error:
+        return "UNKNOWN", "the eligibility broker did not answer (%s)" % error
+    if not isinstance(answer, dict) or answer.get("disposition") not in ELIGIBILITY_DISPOSITIONS \
+            or not isinstance(answer.get("reason"), str):
+        return "UNKNOWN", "the eligibility broker returned a malformed answer"
+    return answer["disposition"], answer["reason"]
+
+
 def cmd_invoke(args):
     if args.agent == "claude":
         argv = ["claude", "-p", "--output-format", "json", "--restricted", "--safe-mode", "--strict-mcp-config",
@@ -133,13 +166,26 @@ def cmd_invoke(args):
     meta = {"agent": args.agent, "requested_model": args.model or None, "actual_models": None,
             "actual_source": None, "status": "failed", "exit_code": None, "error": None}
     started = time.time()
+    # Immediately before every launch (CI): a pull request that is a draft or otherwise ineligible never gets a reviewer.
+    disposition, reason = check_eligibility(args.eligibility_pr, args.eligibility_sha)
+    if disposition != "ELIGIBLE":
+        meta.update({"status": "ineligible" if disposition == "INELIGIBLE" else "eligibility-unknown",
+                     "eligibility": disposition, "duration_s": 0.0,
+                     "error": ("the pull request is not eligible for review: %s" if disposition == "INELIGIBLE"
+                               else "the pull request's eligibility could not be verified: %s") % reason})
+        with open(args.meta, "w", encoding="utf-8") as handle:
+            json.dump(meta, handle, indent=2)
+        sys.stderr.write(meta["error"] + "\n")
+        return 30 if disposition == "INELIGIBLE" else 31
+    environment = {key: value for key, value in os.environ.items()
+                   if key not in REVIEWER_ENV_DENY and not key.startswith("GENCR_ELIGIBILITY_")}
     status = 21
     try:
         with open(args.prompt, "rb") as stdin, open(stdout_path, "wb") as stdout, \
                 open(args.log, "ab") as stderr:
             proc = subprocess.Popen(argv, cwd=args.repo, stdin=stdin, stdout=stdout,
                                     stderr=(subprocess.STDOUT if stdout_path == args.log else stderr),
-                                    start_new_session=True)
+                                    start_new_session=True, env=environment)
             try:
                 meta["exit_code"] = proc.wait(timeout=args.timeout or None)
             except subprocess.TimeoutExpired:
@@ -1002,6 +1048,7 @@ def build_package(args):
         "end_reason": state.get("end_reason"), "final_verdict": state["final_verdict"],
         "verdicts": verdicts, "outcome": outcome, "category": state["category"],
         "exit_code": int(state["exit_code"]), "error": state.get("error") or None,
+        "eligibility": state.get("eligibility") or None,
         "files_examined": files, "invocations": invocations,
         "started_at": state.get("started_at"), "completed_at": now_utc(),
     }
@@ -1345,6 +1392,8 @@ def main():
     invoke.add_argument("--settings", default="")
     invoke.add_argument("--add-dir", action="append", default=[])
     invoke.add_argument("--timeout", type=int, default=0)
+    invoke.add_argument("--eligibility-pr", default="")
+    invoke.add_argument("--eligibility-sha", default="")
     settings = sub.add_parser("trusted-settings")
     settings.add_argument("--tmpdir", default=None)
     repo_id = sub.add_parser("repo-id")

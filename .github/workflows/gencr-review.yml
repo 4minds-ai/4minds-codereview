@@ -137,7 +137,26 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: python3 tools/bin/gencr-ci context --repo "$GITHUB_REPOSITORY" --pr-number "$PR_NUMBER"
 
+      # Draft PRs never get a reviewer: the live PR must be ready for review at the resolved head. This runs as soon as
+      # the PR is resolved and gates every later preparation step, so a confirmed draft (or an event that does not
+      # launch reviews) is a skip even when review preparation would fail: nothing is published. Missing, stale or
+      # ambiguous information fails the job (an infrastructure error, never an approval).
+      - name: Check pull request eligibility (Draft PRs are never reviewed)
+        id: eligibility
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ steps.context.outputs.head_sha }}
+          EVENT_ACTION: ${{ github.event.action }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/gencr-out"
+          status=0
+          python3 tools/bin/gencr-ci eligibility --repo "$GITHUB_REPOSITORY" --pr-number "$PR_NUMBER" \
+            --event "$GITHUB_EVENT_NAME" --action "$EVENT_ACTION" --expected-sha "$HEAD_SHA" \
+            --skip-record "$RUNNER_TEMP/gencr-out/ineligible.json" || status=$?
+          [ "$status" -eq 0 ] || [ "$status" -eq 3 ] || exit "$status"
+
       - name: Check out the pull request head (data only)
+        if: steps.eligibility.outputs.eligibility == 'ELIGIBLE'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ steps.context.outputs.head_sha }}
@@ -148,6 +167,7 @@ jobs:
           lfs: false
 
       - name: Verify the reviewed commit and base
+        if: steps.eligibility.outputs.eligibility == 'ELIGIBLE'
         env:
           HEAD_SHA: ${{ steps.context.outputs.head_sha }}
           BASE_REF: ${{ steps.context.outputs.base_ref }}
@@ -157,31 +177,47 @@ jobs:
 
       - name: Resolve the review scope of a merged pull request (fresh)
         id: scope
-        if: inputs.scope == 'fresh'
+        if: inputs.scope == 'fresh' && steps.eligibility.outputs.eligibility == 'ELIGIBLE'
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ steps.context.outputs.head_sha }}
         run: python3 tools/bin/gencr-ci historical-scope --repo "$GITHUB_REPOSITORY" --pr-number "$PR_NUMBER" --expected-sha "$HEAD_SHA" --target target
 
       - name: Use the mock reviewer CLIs
+        if: steps.eligibility.outputs.eligibility == 'ELIGIBLE'
         run: echo "$GITHUB_WORKSPACE/tools/tests/mocks" >> "$GITHUB_PATH"
 
       - name: Fetch the previous review (incremental)
-        if: inputs.scope == 'incremental'
+        if: inputs.scope == 'incremental' && steps.eligibility.outputs.eligibility == 'ELIGIBLE'
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 tools/bin/gencr-ci find-previous --repo "$GITHUB_REPOSITORY" --pr-number "$PR_NUMBER" --backend "$BACKEND" --out "$RUNNER_TEMP/previous"
 
       - name: Run gencr (headless, read-only reviewers)
         id: run
+        if: steps.eligibility.outputs.eligibility == 'ELIGIBLE'
         working-directory: target
         env:
           CODEREVIEW_BASE_BRANCH: ${{ steps.context.outputs.base_ref }}
           SCOPE_ARG: ${{ steps.scope.outputs.scope_arg }}
           GENCR_REVIEW_COMMENT: "off"
           HOME: ${{ runner.temp }}/home
+          # Held only by the eligibility broker below; removed from gencr's (and so every reviewer's) environment.
+          BROKER_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ steps.context.outputs.head_sha }}
+          EVENT_ACTION: ${{ github.event.action }}
         run: |
           mkdir -p "$HOME"
+          # The engine asks this broker immediately before EVERY reviewer launch whether the PR is still eligible.
+          # A short private directory: Unix socket paths are limited to about 100 characters.
+          broker_dir="$(mktemp -d /tmp/gencr-eligibility.XXXXXX)"
+          sock="$broker_dir/socket" ready="$broker_dir/ready"
+          GH_TOKEN="$BROKER_TOKEN" python3 "$GITHUB_WORKSPACE/tools/bin/gencr-ci" eligibility-broker \
+            --repo "$GITHUB_REPOSITORY" --pr-number "$PR_NUMBER" --event "$GITHUB_EVENT_NAME" --action "$EVENT_ACTION" \
+            --expected-sha "$HEAD_SHA" --socket "$sock" --ready "$ready" &
+          broker=$!
+          for _ in $(seq 50); do [ -f "$ready" ] && break; sleep 0.2; done
+          if [ ! -f "$ready" ]; then echo "gencr: error: the eligibility broker did not start"; kill "$broker"; exit 1; fi
           args=(--"$SCOPE" --pr-number="$PR_NUMBER" --output-dir="$RUNNER_TEMP/gencr-out"
                 --reviewer-timeout="$((TIMEOUT_MINUTES * 60))")
           [ -z "$VERSION" ] || args+=(--version="$VERSION")
@@ -193,13 +229,21 @@ jobs:
           elif [ "$PRIMARY" = claude ]; then args+=(--codex=attack)
           else args+=(--codex=review --claude=attack); fi
           status=0
-          "$GITHUB_WORKSPACE/tools/bin/gencr" "pr-$PR_NUMBER" "${args[@]}" || status=$?
+          env -u BROKER_TOKEN -u GH_TOKEN -u GITHUB_TOKEN GENCR_ELIGIBILITY_SOCKET="$sock" \
+            "$GITHUB_WORKSPACE/tools/bin/gencr" "pr-$PR_NUMBER" "${args[@]}" || status=$?
+          kill "$broker" 2>/dev/null || true
           echo "exit_code=$status" >> "$GITHUB_OUTPUT"
           echo "gencr exit status: $status"
 
       - name: Package the review artifact
         if: always()
-        run: python3 tools/bin/gencr-ci package --output-dir "$RUNNER_TEMP/gencr-out" --pr-number "$PR_NUMBER" --backend "$BACKEND" --out "$RUNNER_TEMP/artifact"
+        env:
+          EXIT_CODE: ${{ steps.run.outputs.exit_code }}
+          HEAD_SHA: ${{ steps.context.outputs.head_sha }}
+        run: >
+          python3 tools/bin/gencr-ci package --output-dir "$RUNNER_TEMP/gencr-out" --pr-number "$PR_NUMBER"
+          --backend "$BACKEND" --out "$RUNNER_TEMP/artifact" --exit-code "$EXIT_CODE" --expected-head "$HEAD_SHA"
+          --previous "$RUNNER_TEMP/previous"
 
       - name: Upload the review artifact
         id: upload
@@ -264,4 +308,8 @@ jobs:
           OUTCOME: ${{ steps.publish.outputs.outcome }}
         run: |
           echo "gencr outcome: ${OUTCOME:-unknown}"
-          test "$OUTCOME" = APPROVED
+          case "$OUTCOME" in
+            APPROVED) ;;
+            "NO NEW REVIEW"|SKIPPED) echo "Not an approval: no new review result; the PR comment and status are unchanged." ;;
+            *) exit 1 ;;
+          esac
