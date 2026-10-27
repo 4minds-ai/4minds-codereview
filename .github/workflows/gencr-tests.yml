@@ -67,3 +67,6 @@ jobs:
 
       - name: Automatic review-mode tests
         run: bash tests/test_gencr_auto.sh
+
+      - name: Adjudication tests (primary authority, explicit positions)
+        run: bash tests/test_gencr_adjudication.sh
