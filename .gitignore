@@ -1,0 +1,9 @@
+# Python bytecode (bin/ helpers are imported by bin/gencr and the tests)
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
+
+# Claude Code per-user settings (shared hooks under git-project/.claude/ stay tracked)
+.claude/settings.local.json
