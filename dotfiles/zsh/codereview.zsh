@@ -72,6 +72,16 @@ Strict scope rule:
 - If the file list looks unexpectedly large, verify the commits with:
 
   git log --oneline --first-parent --no-merges 'origin/${base_branch}'..HEAD
+
+Output format rule:
+- DO NOT USE MARKDOWN TABLES or box-drawing tables anywhere: not in the report file, and not in your chat replies or summaries.
+- Report findings as bullet lists. Reports get pasted into GitHub comments, which are too narrow to show tables well.
+- Start each finding with its ID and a short title, then put details in nested bullets, for example:
+  - **B-1 Cycle test passes even with the fix undone**
+    - File: path/to/file.ts:42
+    - Problem: ...
+    - Fix: ...
+- Use the same bullet format for comparisons such as prior findings vs. how they were fixed.
 EOF
 )"
 
