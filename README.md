@@ -70,7 +70,8 @@ and exits with the outcome. It decides the scope automatically and says so befor
   that is in HEAD's history. Reviews are ordered by commit history, never by timestamp alone;
 - that review already covers HEAD: no reviewer is launched; `gencr` prints the review's ID, commit and verdict and exits
   `0` ("no new review needed" — not an approval);
-- the latest review ended UNRESOLVED DISAGREEMENT, several reviews could be the baseline and none is unambiguously the
+- the latest review ended UNRESOLVED DISAGREEMENT (packages from before primary-reviewer authority; new runs end
+  APPROVED or REQUEST CHANGES), several reviews could be the baseline and none is unambiguously the
   latest (for reviews of one commit: a missing or invalid completion time, or two sharing the latest one), or the latest
   review's own metadata is invalid: `gencr` stops before any reviewer (exit `1`), lists them, and asks you to add
   `--incremental` (optionally `--previous=<package>`) or `--fresh`. A package with invalid metadata is never coerced into
@@ -172,26 +173,39 @@ gencr --help
   field value, verdict and peer reference is unchanged byte for byte, then validates the result with the same rules.
   The reviewer's response is kept as `<id>.report.original.md`, `<id>.normalization.json` records the repairs, and the
   reports say "format normalized". Anything else stays INCOMPLETE.
-- Finding ownership: a reviewer's `## Findings` holds only the findings it authors, under its own prefix (an incremental
-  review's unfixed previous findings keep their original IDs). It accepts, rejects or disputes the other reviewer's
-  findings only by reference: exactly one `- CODEX-1: accepted — <evidence>` row per finding of the report it answers,
-  and the ID under `## Merge blockers` when it blocks. To keep accepting a finding the other reviewer's latest report
-  no longer lists, it writes the source-qualified row its handoff shows, `- CODEX-2 (report <earlier report ID>):
-  accepted — <evidence>` (acceptance only; leaving the row out withdraws it). A restated or renamed peer finding, a
-  row that names no finding of the report it refers to, or a repeated row makes the report invalid (it is never
-  renamed or repaired). An accepted peer finding stays in the consolidated report, `findings.json` and the review
-  comment under its original ID and author, taken from the exact report version that was accepted, even if its
-  author no longer lists it.
+- Finding ownership and explicit positions (report contract v2): a reviewer's `## Findings` holds only the findings it
+  authors, under its own prefix (an incremental review's unfixed previous findings keep their original IDs), each with
+  `Introduced by this change: yes|no`. Every earlier finding of its own is either restated there (its current version)
+  or withdrawn under `## Withdrawn findings` (`- CLAUDE-2: withdrawn — <reason>`); leaving one out makes the report
+  invalid. It states its position on each of the other reviewer's findings only by reference, one row per finding of
+  the report it answers, with every facet: `- CODEX-1: accepted; introduced: yes; severity: medium; blocking: no —
+  <evidence>` (or `disputed; …`, or `- CODEX-1: rejected — <evidence>`); `blocking: yes` goes with the ID under
+  `## Merge blockers`. A claim on a finding its author withdrew is kept or ended with the source-qualified row its
+  handoff shows, `- CODEX-2 (report <ID>): accepted; … — <evidence>` or `… (report <ID>): withdrawn — <reason>`.
+  Objections to a finding's evidence, fix or scope go under `## Supplemental objections` (`- CLAUDE-O1 (CODEX-2; fix):
+  raised — <why>`, later maintained, conceded or withdrawn; the other reviewer answers `- CLAUDE-O1: accepted|rejected
+  — <why>`; its latest answer to the objection's current wording decides it, so a later rejection reopens an earlier
+  acceptance). A finding whose text or blocking position changed is a new version: an earlier assessment of it is never
+  counted as agreement. A restated or renamed peer finding, a missing facet, a row that names no finding of the report it refers
+  to, a repeated row or an unanswered objection makes the report invalid (format normalization never supplies a
+  judgment). A finding stays in the consolidated report while either reviewer keeps a claim on it, under its original
+  ID and author.
 - Observations that are not findings: the review instructions ask every reviewer to finish with verified clean checks,
   unresolved risks, disproven claims, test gaps and out-of-scope ownership changes. Each report ends (after every other
   section) with `## Review notes`, holding exactly these entries in order: `Verified clean`, `Unresolved risks`,
   `Disproven claims`, `Test gaps`, `Out-of-scope ownership changes`, `Other observations` (`None` when empty). They are
   kept in the full report and `findings.json` (`review_notes`), never counted as findings or blockers, and not shown in
   the review comment. `## Outstanding disputed findings` holds only one row per disputed finding, `- CODEX-2: <why>`,
-  naming a finding of the review; observation text there, inside `## Findings`, or under an unknown `##` heading after
-  the first section makes the report invalid (it is never moved).
-- Adversarial reviews stop when both reviewers approve, or both request changes with aligned findings; otherwise they
-  reconcile for at most 3 rounds, counted by `gencr`.
+  naming a finding of the review; it is the reviewer's dated statement (gencr takes the disputes from the explicit
+  positions). Observation text there, inside `## Findings`, or under an unknown `##` heading after the first section
+  makes the report invalid (it is never moved).
+- Primary-reviewer authority: the primary reviewer's latest valid verdict is the review's verdict (primary APPROVED +
+  attacker REQUEST CHANGES = APPROVED; primary REQUEST CHANGES + attacker APPROVED = REQUEST CHANGES). The attacker has
+  no veto; its unresolved objections stay in every artifact with both reviewers' positions. gencr folds the reports in
+  order into a ledger of each reviewer's latest position per finding — exists, introduced by this change, severity,
+  blocks merge — and the version each position assessed. The review stops as soon as both verdicts and every position
+  agree; otherwise the reviewers reconcile for at most 3 rounds, counted by `gencr`, and the primary always answers the
+  attacker's latest report. A missing, invalid or incomplete report never yields a verdict (INCOMPLETE).
 - `--reviewer-timeout=SECONDS` stops a reviewer that runs too long. The review refuses uncommitted tracked changes and
   fails if HEAD or tracked files change during the review.
 
@@ -207,21 +221,33 @@ When a headless review finishes and its package is saved, `gencr` prints a short
 GitHub's REQUEST CHANGES review, between `========== GITHUB REVIEW COMMENT ==========` and
 `========== END REVIEW COMMENT ==========`, then the path of the complete report (send it to the developer with the
 comment). The comment is the block saved at the top of `summary.md` (the PR comment in CI uses the same block). It is
-built from the final results only, without calling a reviewer: the verdict (or, for an incomplete run, that no valid
-approval or rejection was produced), the mode and approval scope, the reviewed commit, the models, every merge blocker
-first (by severity), then up to five other significant findings and the disputed items, and an instruction to address
-the full report. Each finding shows who listed it and the other reviewer's explicit position on it ("accepted",
-"rejected", "disputed", "not assessed", or "accepted an earlier version" when the finding changed after that review);
-an overall verdict is never presented as agreement on a finding, and a review that ended without agreement says so.
-Recommended fixes are copied verbatim (in a code block when they contain `@`, HTML comments or similar). The comment is
-limited to 40,000 characters: if the merge blockers do not all fit, it states the total, how many it lists and how
-many more there are (with their IDs when they fit); the complete report and `findings.json` always have all of them.
-Set `GENCR_REVIEW_COMMENT=off` to print a one-line result instead (the CI workflow does).
+built from the final adjudicated results only, without calling a reviewer:
 
-The terminal's final line marks the verdict (`gencr: final verdict: ✅ APPROVED` / `❌ REQUEST CHANGES`); the verdict
-tokens in reports, `findings.json`, metadata and the review comment are unchanged.
+- the verdict and whether it is unanimous: `APPROVED — unanimous: both reviewers approve and agree on every finding.`,
+  or `APPROVED by primary reviewer — NOT UNANIMOUS; N attacker objections remain.` (likewise for REQUEST CHANGES), both
+  reviewers' verdicts, the number of attacker objections and of the primary's merge blockers, the mode and approval
+  scope, the reviewed commit and the models;
+- every attacker objection (of any severity), first as an index entry: its ID, title, original author, file and each
+  reviewer's position on existence, introduced by this change, severity and blocking (with the version caveat when a
+  position assessed an earlier version); then — as space allows — evidence (an excerpt), the recommended fix (verbatim
+  in a code block, or a pointer when it does not fit), the primary's response, the attacker's latest dated statement
+  ("answered later by …" when the other reviewer replied) and each open supplemental objection with the other
+  reviewer's latest response (marked when it answered an earlier version of the objection);
+- the primary reviewer's merge blockers by severity, then up to five other significant findings, each with the other
+  reviewer's explicit position ("accepted", "rejected", "disputed", "not assessed", or "accepted an earlier version").
 
-Exit status: `0` APPROVED (or no new review needed: the previous review already covers HEAD), `10` REQUEST CHANGES, `11` UNRESOLVED DISAGREEMENT, `20` INCOMPLETE (invalid report, missing
+The comment is limited to 40,000 characters. Whatever does not fit is disclosed with numbers ("N of M attacker
+objections are not shown in this comment", or not shown in full); the complete report, `findings.json` and every other
+saved file are never shortened, locally or in CI. The full report's `## Adjudication` section has every finding with
+both positions, version labels, statements and history. Set `GENCR_REVIEW_COMMENT=off` to print a one-line result
+instead (the CI workflow does).
+
+The terminal's final line marks the verdict with its qualification (`gencr: final verdict: ✅ APPROVED by primary
+reviewer — NOT UNANIMOUS; 1 attacker objections remain; report: …`); the verdict tokens in reports, `findings.json`,
+metadata and the review comment are APPROVED and REQUEST CHANGES.
+
+Exit status: `0` APPROVED (also when not unanimous; or no new review needed: the previous review already covers HEAD), `10`
+REQUEST CHANGES, `20` INCOMPLETE (invalid report, missing
 prompt part, repository changed), `21` reviewer failure (CLI error, empty report, model selection failure), `22` timeout,
 `23` the report could not be saved, `2` usage error, `1` other errors (including a declined FRESH confirmation and a review
 mode that needs your decision).
@@ -240,6 +266,7 @@ bash tests/test_gencr_notes.sh # review notes and disputed rows (replays a real 
 bash tests/test_gencr_values.sh # field values: inline, block, fences and reserved lines (replays a real failure)
 bash tests/test_gencr_auto.sh   # automatic FRESH/INCREMENTAL selection and the --fresh confirmation (pseudo-terminal)
 bash tests/test_gencrclaude.sh  # gencrclaude: the original Claude workflow, independent of gencr
+bash tests/test_gencr_adjudication.sh  # primary-reviewer authority, explicit positions and chronological adjudication
 bash tests/run_ubuntu.sh      # all suites in a clean Ubuntu container (needs Docker)
 ```
 
@@ -329,6 +356,7 @@ These are enforced regardless of PR size or context:
 ├── bin/
 │   ├── gencr                             # Headless reviews: automatic FRESH/INCREMENTAL, single or adversarial
 │   ├── gencr_support.py                  # Reviewer invocation, previous-review lookup, report packages
+│   ├── gencr_adjudicate.py               # Primary authority: the chronological claim ledger and its validation
 │   ├── gencr_duplicates.py               # Incremental duplication pre-search and validation
 │   └── gencr-ci                          # GitHub Actions adapter (gate, PR context, artifact, PR comment)
 ├── .github/workflows/
@@ -343,6 +371,8 @@ These are enforced regardless of PR size or context:
 │   ├── test_gencr_values.sh              # Field-value grammar tests (blocks, fences, reserved lines)
 │   ├── test_gencr_auto.sh                # Automatic review-mode and --fresh confirmation tests
 │   ├── test_gencrclaude.sh               # gencrclaude (original Claude workflow) tests
+│   ├── test_gencr_adjudication.sh        # Adjudication: unit (adjudication_unit.py) and end to end (adjudication_e2e.py)
+│   ├── v2reports.py                      # Contract-v2 report builder for the adjudication tests
 │   ├── workflow_sim.py                   # Runs gencr-review.yml locally, step by step (for test_gencr_ci.sh)
 │   ├── run_ubuntu.sh                     # Runs every suite in Docker (Ubuntu)
 │   ├── mocks/                            # Mock claude, codex and gh CLIs
