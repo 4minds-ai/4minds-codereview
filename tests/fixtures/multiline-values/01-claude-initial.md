@@ -6,6 +6,7 @@ Verdict: **REQUEST CHANGES**. The new settings form ships without tests.
 
 - **CLAUDE-1 New settings form, panel registration and provider download path ship without tests**
   - Severity: 🔴 BLOCKER
+  - Introduced by this change: yes
   - File: app.py:1
   - Problem: three pieces of new code have no tests:
     - The settings form is a new component with no test file.
@@ -24,6 +25,7 @@ Verdict: **REQUEST CHANGES**. The new settings form ships without tests.
 
 - **CLAUDE-2 The source appears in every picker but no panel can render it**
   - Severity: High
+  - Introduced by this change: yes
   - File: app.py:2
   - Problem: the catalog marks the source as a data source; all three pickers list it:
     - the main panel
@@ -36,6 +38,7 @@ Verdict: **REQUEST CHANGES**. The new settings form ships without tests.
 
 - **CLAUDE-3 Re-enabling sync creates a second snapshot**
   - Severity: Medium
+  - Introduced by this change: yes
   - File: app.py:3
   - Problem: synthetic problem 3
   - Evidence: (traced, not executed) synthetic evidence 3
@@ -45,6 +48,7 @@ Verdict: **REQUEST CHANGES**. The new settings form ships without tests.
 
 - **CLAUDE-4 Interactive import ignores the byte budget**
   - Severity: Medium
+  - Introduced by this change: yes
   - File: app.py:4
   - Problem: synthetic problem 4
   - Evidence: (traced, not executed) synthetic evidence 4
@@ -54,6 +58,7 @@ Verdict: **REQUEST CHANGES**. The new settings form ships without tests.
 
 - **CLAUDE-5 Every scheduled run re-exports everything**
   - Severity: Medium
+  - Introduced by this change: yes
   - File: app.py:5
   - Problem: synthetic problem 5
   - Evidence: (traced, not executed) synthetic evidence 5
@@ -63,12 +68,16 @@ Verdict: **REQUEST CHANGES**. The new settings form ships without tests.
 
 - **CLAUDE-6 Failure reasons never reach the user**
   - Severity: Low
+  - Introduced by this change: yes
   - File: app.py:6
   - Problem: synthetic problem 6
   - Evidence: (traced, not executed) synthetic evidence 6
   - Expected vs actual: expected x, actual y
   - Tests: none detect it
   - Fix: synthetic fix 6
+
+## Withdrawn findings
+- None
 
 ## Disposition of peer findings
 
@@ -77,6 +86,9 @@ Verdict: **REQUEST CHANGES**. The new settings form ships without tests.
 ## Merge blockers
 
 - CLAUDE-1
+
+## Supplemental objections
+- None
 
 ## Outstanding disputed findings
 

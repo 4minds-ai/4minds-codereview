@@ -24,6 +24,7 @@ CLAUDE_DENIED_TOOLS = "Bash,Edit,Write,NotebookEdit"
 PACKAGE_FILES = ("summary.md", "full-report.md", "findings.json", "reconciliation.md", "metadata.json")
 import gencr_report  # noqa: E402  (the one report grammar)
 import gencr_summary  # noqa: E402  (the GitHub-ready review comment)
+import gencr_adjudicate  # noqa: E402  (primary authority and the chronological claim ledger)
 from gencr_report import FIELD_LABELS, OPTIONAL_LABELS, ID_RE  # noqa: E402
 AGENT_NAMES = {"claude": "Claude", "codex": "Codex"}
 
@@ -337,26 +338,6 @@ def parse_ids(lines):
     return ids
 
 
-REPORT_ID_RE = r"[0-9]{2}-round[0-9]+-(?:claude|codex)-(?:initial|attack|reconcile|respond)"
-# "- CODEX-2 (report 02-round0-codex-attack): accepted — <evidence>": keeps accepting a finding of an earlier peer report.
-QUALIFIED_START_RE = re.compile(r"^- \**(" + ID_RE + r")\**\s*\(\s*report\b", re.I)
-QUALIFIED_RE = re.compile(r"^- \**(" + ID_RE + r")\**\s*\(report (" + REPORT_ID_RE + r")\)\**:\s*(accepted|rejected|disputed)\b"
-                          r" *(?:[\u2014\u2013:,]|-(?= ))? *(.*)$", re.I)
-
-
-def parse_peer_rows(lines):
-    """The rows of "## Disposition of peer findings": plain rows (source None) and source-qualified rows (source = the
-    earlier peer report), with a list of malformed source-qualified rows (never treated as prose)."""
-    rows = [dict(row, source=None) for row in parse_dispositions(lines, "accepted|rejected|disputed")]
-    for match, body in gencr_report.continued_entries(lines, QUALIFIED_RE):
-        evidence = "\n".join(([match.group(4)] if match.group(4) else []) + body[1:])
-        rows.append({"id": match.group(1).upper(), "status": match.group(3).lower(), "evidence": evidence,
-                     "source": match.group(2)})
-    malformed = [line for line in lines if QUALIFIED_START_RE.match(line)
-                 and not (QUALIFIED_RE.match(line) and re.search(r"[A-Za-z0-9]", QUALIFIED_RE.match(line).group(4)))]
-    return rows, malformed
-
-
 def parse_dispositions(lines, words):
     """Disposition/verification entries with their complete evidence, including continuation lines."""
     entry = re.compile(r"^- \**(" + ID_RE + r")\**:\s*(" + words + r")\b *(?:[\u2014\u2013:,]|-(?= ))? *(.*)$", re.I)
@@ -464,9 +445,29 @@ def count(value):
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
-def metadata_problem(metadata):
+def adjudication_problem(metadata, findings):
+    """Why a package's stored adjudication cannot be trusted, or None. Absent (older or single-reviewer packages) is
+    fine; present but malformed, inconsistent with the outcome, roles and invocation records, or different between
+    metadata.json and findings.json, is never trusted (no approval, no baseline)."""
+    adjudication, copy = metadata.get("adjudication"), (findings or {}).get("adjudication")
+    if adjudication is None and copy is None:
+        return None
+    if adjudication is not None:
+        problems = gencr_adjudicate.validate(adjudication, metadata.get("invocations"), metadata.get("outcome"),
+                                             metadata.get("primary"), metadata.get("adversary"))
+        if problems:
+            return "its adjudication is invalid (%s)" % "; ".join(problems[:2])
+    if json.dumps(copy, sort_keys=True) != json.dumps(adjudication, sort_keys=True):
+        return "its adjudication differs between metadata.json and findings.json"
+    return None
+
+
+def metadata_problem(metadata, findings):
     """Why a compatible package's own metadata cannot be trusted for selection, or None. Absent additive fields (older
     schema-1 packages) are fine; present fields of the wrong type or value are not, and are never coerced."""
+    problem = adjudication_problem(metadata, findings)
+    if problem:
+        return problem
     run_id = metadata.get("run_id")
     if not isinstance(run_id, str) or not run_id or re.search(r"[\x00-\x1f\x7f/]", run_id):
         return "its run ID is missing or invalid"
@@ -529,7 +530,7 @@ def evaluate_previous(candidate, args):
         # A compatible review on HEAD's history with untrustworthy metadata stays in the history (it may be the
         # latest review, e.g. an UNRESOLVED barrier) but can never be selected: "invalid" stops the selection.
         try:
-            invalid = metadata_problem(metadata)
+            invalid = metadata_problem(metadata, findings)
         except Exception as error:  # never the candidate-drop path below: an unvalidatable package stays a barrier
             invalid = "its metadata could not be validated (%s)" % type(error).__name__
         return {"path": run_dir, "metadata": metadata, "findings": findings,
@@ -881,7 +882,8 @@ def comment_data(state, metadata, final_findings, blockers, dispositions, finals
                          "fixes": fixes, "blocker": any(f["blocker"] for f in group),
                          "reporters": [f["reported_by"] for f in group], "differs": len(versions) > 1,
                          "listed_by": [a for a in agents if identifier in (blockers.get(a) or [])],
-                         "assessment": "; ".join(labels), "contested": contested})
+                         "assessment": "; ".join(labels), "contested": contested,
+                         "adjudication_positions": (first.get("adjudication") or {}).get("positions")})
     return {"final_verdict": metadata["final_verdict"], "outcome": metadata["outcome"],
             "convergence": state.get("convergence") or None, "error": metadata.get("error"),
             "max_rounds": metadata["max_rounds"], "agents": agents, "verdicts": metadata["verdicts"],
@@ -970,7 +972,10 @@ def build_package(args):
         for finding in parse_findings(text):
             finding.update({"reported_by": agent, "report_id": report_id, "blocker": finding["id"] in agent_blockers})
             final_findings.append(finding)
-        dispositions[agent] = parse_peer_rows(section(text, "Disposition of peer findings"))[0]
+        # Contract-v2 rows: status, facets and source; "evidence" is the row's rationale.
+        dispositions[agent] = [{"id": r["id"], "status": r["status"], "evidence": r["rationale"], "source": r["source"],
+                                "introduced": r["introduced"], "severity": r["severity"], "blocking": r["blocking"]}
+                               for r in gencr_report.parse_positions(text)["rows"]]
         if incremental:
             verification[agent] = parse_dispositions(section(text, "Previous findings verification"),
                                                      "not fixed|fixed|obsolete")
@@ -1021,6 +1026,38 @@ def build_package(args):
     for finding in final_findings:
         finding["blocker"] = finding["id"] in all_blockers
 
+    # Primary-reviewer authority and the chronological claim ledger (contract v2), for completed two-reviewer runs.
+    adjudication = None
+    valid_ids = [inv["id"] for inv in invocations if inv["verdict"]]
+    if adversary and outcome in ("APPROVED", "REQUEST CHANGES"):
+        adjudication = gencr_adjudicate.adjudicate(run_reports(run_dir, valid_ids), state["primary"], adversary)
+        problems = gencr_adjudicate.validate(adjudication, invocations, outcome, state["primary"], adversary)
+        if problems:
+            raise ValueError("inconsistent adjudication: %s" % "; ".join(problems))
+        # Every live finding stays open with its author's latest definition (also after the author withdrew it while
+        # the other reviewer keeps its claim); findings no claim keeps alive leave the open set.
+        texts = {rid: read_report(os.path.join(run_dir, rid + ".report.md")) for rid in valid_ids}
+        live = {identifier: f for identifier, f in adjudication["findings"].items() if f["live"]}
+        kept = []
+        for identifier in sorted(live, key=id_sort_key):
+            f = live[identifier]
+            match = [d for d in parse_findings(texts[f["definition"]["report"]]) if d["id"] == identifier]
+            if not match:
+                raise ValueError("finding %s has no definition in report %s" % (identifier, f["definition"]["report"]))
+            match[0].update({"reported_by": f["author"], "report_id": f["definition"]["report"],
+                             "blocker": identifier in all_blockers, "adjudication": f})
+            kept.append(match[0])
+            # A previous finding both reviewers carry forward keeps the other reviewer's definition too (its copy).
+            for agent, (report_id, text) in finals.items():
+                if agent == f["author"]:
+                    continue
+                copy = [d for d in parse_findings(text) if d["id"] == identifier]
+                if copy:
+                    copy[0].update({"reported_by": agent, "report_id": report_id, "blocker": identifier in all_blockers,
+                                    "adjudication": f})
+                    kept.append(copy[0])
+        final_findings = kept
+
     lineage = set(state.get("lineage", "").split()) | {f["id"] for f in final_findings}
     metadata = {
         "schema": SCHEMA, "run_id": state["run_id"], "tool": "gencr", "review_mode": state["review_mode"],
@@ -1051,6 +1088,7 @@ def build_package(args):
         "eligibility": state.get("eligibility") or None,
         "files_examined": files, "invocations": invocations,
         "started_at": state.get("started_at"), "completed_at": now_utc(),
+        "report_contract": 2, "adjudication": adjudication,
     }
     header = render_header(metadata)
 
@@ -1059,15 +1097,21 @@ def build_package(args):
         counts[finding["severity"]] += 1
     title = "Code Review: %s" % state["branch"]
     disputes, dispute_items = [], []
-    for agent, (report_id, text) in finals.items():
+    for f in final_findings if adjudication else []:
+        if f["adjudication"]["status"] == "opposed":
+            disputes.append("%s (%s's finding): %s" % (f["id"], AGENT_NAMES[f["reported_by"]],
+                                                       gencr_summary.facet_summary(f["adjudication"], adjudication)))
+    for agent, (report_id, text) in ([] if adjudication else finals.items()):
         # One item per disputed row (its continuation lines included), never one per line.
         for row in gencr_report.parse_disputes(section(text, "Outstanding disputed findings"))[0]:
             item = row["item"]
             disputes.append("%s (%s)" % (" ".join(item.split()), AGENT_NAMES[agent]))
             dispute_items.append((agent, item))
 
-    comment = gencr_summary.safe_render(comment_data(state, metadata, final_findings, blockers, dispositions, finals,
-                                                invocations, dispute_items, run_dir))
+    data = comment_data(state, metadata, final_findings, blockers, dispositions, finals, invocations, dispute_items, run_dir)
+    data["adjudication"] = adjudication
+    data["objections"] = gencr_summary.objection_units(final_findings, adjudication) if adjudication else []
+    comment = gencr_summary.safe_render(data)
     summary = ["# %s — summary" % title, "", gencr_summary.BEGIN] + comment.rstrip("\n").split("\n") + [
         gencr_summary.END, "", "## Review details", "", header.rstrip("\n"), "",
         "## Findings by severity", "",
@@ -1088,6 +1132,12 @@ def build_package(args):
             "- Transcripts: %s" % run_dir,
             "- Findings and evidence below are as reported by the reviewers; gencr validates the report format, not the findings.",
             "- Reviewers ran read-only: any claim that needs a test run is unverified unless the reviewer says otherwise."]
+    if adjudication:
+        full += ["- " + gencr_summary.qualification(adjudication),
+                 "- Verdicts: %s" % gencr_summary.verdicts_line(adjudication),
+                 "- Attacker objections: %d" % adjudication["counts"]["attacker_objections"],
+                 "- Adjudication: the primary reviewer's latest valid verdict decides; every finding below carries both "
+                 "reviewers' explicit positions (see '## Adjudication')."]
     if metadata["error"]:
         full.append("- Error: %s" % metadata["error"])
     for inv in invocations:
@@ -1111,13 +1161,21 @@ def build_package(args):
             headings.append("Previous findings verification")
         for heading in headings + ["Findings", "Review notes"]:
             full += ["### " + heading, bullets(section(text, heading)).rstrip("\n"), ""]
+    if adjudication:
+        full += gencr_summary.adjudication_section(final_findings, adjudication)
     # The canonical open-finding set (what the next incremental review must verify), with full evidence,
     # including blockers whose definition is in an earlier report of the run.
     full += ["## Open findings (canonical)", ""]
     for finding in final_findings:
         provenance = "defined by %s in report %s" % (AGENT_NAMES.get(finding["reported_by"], finding["reported_by"]),
                                                      finding["report_id"])
-        if finding.get("defined_in_earlier_report"):
+        claims = finding.get("adjudication") or {}
+        if claims.get("withdrawn"):
+            peer = [a for a in claims["positions"] if a != claims["author"]]
+            provenance += "; withdrawn by %s in report %s; kept open by %s's claim (report %s)" % (
+                AGENT_NAMES[claims["author"]], claims["withdrawn"]["report"],
+                AGENT_NAMES[peer[0]] if peer else "the other reviewer", claims["positions"][peer[0]]["report"] if peer else "?")
+        elif finding.get("defined_in_earlier_report"):
             provenance += " (an earlier report; cited as a merge blocker in the final reports)"
         elif finding.get("accepted_by"):
             provenance += " (accepted by %s in its final report %s; not in %s's final report %s)" % (
@@ -1125,6 +1183,8 @@ def build_package(args):
                 AGENT_NAMES[finding["reported_by"]], finding["author_final_report"])
         full.append("- **%s %s**%s" % (finding["id"], finding["title"], " — merge blocker" if finding["blocker"] else ""))
         full.append("  - Provenance: %s" % provenance)
+        if finding.get("adjudication"):
+            full.append("  - Adjudication: %s" % gencr_summary.facet_summary(finding["adjudication"], adjudication))
         for label in FIELD_LABELS + OPTIONAL_LABELS:
             if finding["fields"].get(label):
                 full += field_lines("  ", label, finding["fields"][label], (finding.get("layouts") or {}).get(label))
@@ -1180,7 +1240,7 @@ def build_package(args):
                     "final_findings": final_findings, "blockers": blockers, "dispositions": dispositions,
                     "previous_verification": verification if incremental else None,
                     "duplication": dict(duplication, dispositions=dup_dispositions) if duplication else None,
-                    "lineage_ids": sorted(lineage, key=id_sort_key),
+                    "lineage_ids": sorted(lineage, key=id_sort_key), "adjudication": adjudication,
                     # Observations that are not findings, per final report; never findings, blockers or disputes.
                     "review_notes": {agent: gencr_report.parse_notes(section(text, "Review notes"))[0]
                                      for agent, (_, text) in finals.items()}}
@@ -1232,57 +1292,78 @@ def cmd_check_report(args):
     return 0
 
 
-def cmd_check_dispositions(args):
-    """The rows of "## Disposition of peer findings" are the only machine-readable references to peer findings, and
-    packaging keeps the accepted ones. A plain row must name a finding of the assessed peer report (--ids, whatever its
-    prefix). A source-qualified row keeps accepting a finding that report no longer lists: it must be "accepted", name
-    an earlier valid report of the peer in this run (--history) that defines the finding. One row per finding."""
+def run_reports(run_dir, ids):
+    """The run's valid reports in invocation order, as the adjudication reads them."""
+    reports = []
+    for rid in ids:
+        path = os.path.join(run_dir, rid + ".report.md")
+        if not os.path.isfile(path):
+            raise ValueError("cannot check the dispositions: missing report %s" % path)
+        text = read_report(path)
+        peer = re.search(r"^PEER-REPORT: *(\S+) *$", text, re.M)
+        reports.append({"id": rid, "agent": rid.split("-")[2], "text": text,
+                        "peer_report": None if not peer or peer.group(1) == "N/A" else peer.group(1)})
+    return reports
+
+
+def cmd_check_positions(args):
+    """Contract-v2 positions of a new report against the run's valid prior reports (gencr_adjudicate.check_report)."""
     try:
         text = read_report(args.report)
+        prior = run_reports(args.run_dir, args.reports.split())
     except ValueError as error:
         die(str(error))
-    rows, malformed = parse_peer_rows(section(text, "Disposition of peer findings"))
-    if malformed:
-        die("malformed source-qualified disposition row: %s; write '- <ID> (report <report ID>): accepted — <evidence>'"
-            % malformed[0])
-    allowed, history, seen = set(args.ids.split()), args.history.split(), set()
-    for row in rows:
-        identifier, source = row["id"], row["source"]
-        if source is None and identifier not in allowed:
-            if args.peer_report == "N/A":
-                die("disposition row %s does not name a finding in the other reviewer's report (there is none yet); "
-                    "write '- None'" % identifier)
-            die("disposition row %s does not name a finding in %s's report %s; list only that report's findings, "
-                "and explain a withdrawal of your own finding in prose" % (identifier, args.peer_name, args.peer_report))
-        if source is not None:
-            if row["status"] != "accepted":
-                die("disposition row %s (report %s): only 'accepted' can be kept from an earlier report"
-                    % (identifier, source))
-            if source not in history:
-                die("disposition row %s: report %s is not a valid earlier report by %s in this review"
-                    % (identifier, source, args.peer_name or "the other reviewer"))
-            if identifier in allowed:
-                die("disposition row %s: %s is in %s's report %s: assess its current version with a plain "
-                    "'- %s: <status> — <evidence>' row" % (identifier, identifier, args.peer_name, args.peer_report,
-                                                            identifier))
-            defined = {f["id"] for f in parse_findings(read_report(os.path.join(args.run_dir, source + ".report.md")))}
-            if identifier not in defined:
-                die("disposition row %s: %s is not defined in %s's report %s"
-                    % (identifier, identifier, args.peer_name, source))
-        if identifier in seen:
-            die("duplicate disposition rows for %s; give each finding of the other reviewer exactly one row" % identifier)
-        seen.add(identifier)
+    peer = args.attacker if args.agent == args.primary else args.primary
+    errors = gencr_adjudicate.check_report(text, args.agent, peer, None if args.peer_report == "N/A" else args.peer_report,
+                                           prior, set(args.known.split()))
+    if errors:
+        die("; ".join(errors[:3]) + ("" if len(errors) <= 3 else " (and %d more)" % (len(errors) - 3)))
     return 0
 
 
-def cmd_kept_acceptances(args):
-    """'<ID> <source>' for each acceptance in a reviewer's previous report (--report, which answered --assessed) of a
-    finding the peer's current report no longer lists (not in --ids): what the reviewer may keep accepting."""
-    rows, _ = parse_peer_rows(section(read_report(args.report), "Disposition of peer findings"))
-    current = set(args.ids.split())
-    for row in rows:
-        if row["status"] == "accepted" and row["id"] not in current:
-            print("%s %s" % (row["id"], row["source"] or args.assessed))
+def cmd_handoff_state(args):
+    """The handoff lines of contract v2: what the reviewer must restate, keep, withdraw or answer."""
+    peer = args.attacker if args.agent == args.primary else args.primary
+    try:
+        prior = run_reports(args.run_dir, args.reports.split())
+    except ValueError as error:
+        die(str(error))
+    state = gencr_adjudicate.handoff(prior, args.agent, peer, None if args.peer_report == "N/A" else args.peer_report)
+    name = AGENT_NAMES[peer]
+    if state["own_live"]:
+        print("- Your findings in this review so far (each must be in your '## Findings' with its current version, or "
+              "under '## Withdrawn findings' as '- <ID>: withdrawn — <reason>'; leaving one out is invalid): %s"
+              % ", ".join(state["own_live"]))
+    if state["kept_claims"]:
+        print("- Your claims on findings that %s's latest report no longer defines (keep each with its source-qualified "
+              "row, or withdraw it): %s" % (name, "; ".join(
+                  "- %s (report %s): %s; introduced: ...; severity: ...; blocking: ... — <rationale>   or   - %s (report "
+                  "%s): withdrawn — <reason>" % (k["id"], k["source"], k["status"], k["id"], k["source"])
+                  for k in state["kept_claims"])))
+    if state["own_objections"]:
+        print("- Your open supplemental objections (restate each as maintained, conceded or withdrawn): %s" % ", ".join(
+            "%s (%s; %s)" % (o["id"], o["finding"], o["topic"]) for o in state["own_objections"]))
+    if state["peer_objections"]:
+        print("- %s's open supplemental objections to answer (one '- <ID>: accepted|rejected — <rationale>' row each "
+              "under '## Supplemental objections'): %s" % (name, ", ".join(
+                  "%s (%s; %s)" % (o["id"], o["finding"], o["topic"]) for o in state["peer_objections"])))
+    return 0
+
+
+def cmd_adjudicate(args):
+    """The adjudication of the run so far (stop gate): one JSON object on stdout."""
+    adj = gencr_adjudicate.adjudicate(run_reports(args.run_dir, args.reports.split()), args.primary, args.attacker)
+    print(json.dumps({key: adj[key] for key in ("needs_another_round", "unanimous", "positions_agree", "verdicts_agree",
+                                                "primary_verdict", "attacker_verdict", "counts")}))
+    print("decision=%s" % ("continue" if adj["needs_another_round"] else "stop"), file=sys.stderr)
+    return 0
+
+
+def cmd_verdict_line(args):
+    """The final verdict with its adjudicated qualification, from a saved package (terminal line)."""
+    metadata = json.loads(read_text(os.path.join(args.run_dir, "metadata.json")))
+    adjudication = metadata.get("adjudication")
+    print(gencr_summary.qualification(adjudication).rstrip(".") if adjudication else metadata["outcome"])
     return 0
 
 
@@ -1419,12 +1500,17 @@ def main():
     check_report = sub.add_parser("check-report")
     check_report.add_argument("--report", required=True)
     check_report.add_argument("--known", default=None)
-    check_dispositions = sub.add_parser("check-dispositions")
-    for name in ("--report", "--peer-report", "--peer-name", "--ids", "--history", "--run-dir"):
-        check_dispositions.add_argument(name, required=True)
-    kept = sub.add_parser("kept-acceptances")
-    for name in ("--report", "--assessed", "--ids"):
-        kept.add_argument(name, required=True)
+    positions = sub.add_parser("check-positions")
+    for flag in ("--report", "--agent", "--peer-report", "--run-dir", "--reports", "--primary", "--attacker", "--known"):
+        positions.add_argument(flag, required=flag not in ("--reports", "--known"), default="")
+    handoff = sub.add_parser("handoff-state")
+    for flag in ("--agent", "--peer-report", "--run-dir", "--reports", "--primary", "--attacker"):
+        handoff.add_argument(flag, required=flag != "--reports", default="")
+    verdict_line = sub.add_parser("verdict-line")
+    verdict_line.add_argument("--run-dir", required=True)
+    adjudicate = sub.add_parser("adjudicate")
+    for flag in ("--run-dir", "--reports", "--primary", "--attacker"):
+        adjudicate.add_argument(flag, required=True)
     normalize_report = sub.add_parser("normalize-report")
     for name in ("--original", "--out", "--record", "--canonical"):
         normalize_report.add_argument(name, required=True)
@@ -1461,9 +1547,10 @@ def main():
                 "validate-duplication": cmd_validate_duplication,
                 "sha256": lambda a: print(sha256_file(a.file)) or 0,
                 "realpath": lambda a: print(os.path.realpath(a.path)) or 0, "outside-repo": cmd_outside_repo,
-                "introduction": cmd_introduction, "check-report": cmd_check_report, "check-dispositions": cmd_check_dispositions,
+                "introduction": cmd_introduction, "check-report": cmd_check_report,
                 "value-rule": lambda a: print(gencr_report.value_rule()) or 0,
-                "kept-acceptances": cmd_kept_acceptances,
+                "check-positions": cmd_check_positions, "handoff-state": cmd_handoff_state,
+                "adjudicate": cmd_adjudicate, "verdict-line": cmd_verdict_line,
                 "normalize-report": cmd_normalize_report, "note-normalization": cmd_note_normalization,
                 "review-comment": cmd_review_comment}
     if args.command not in handlers:

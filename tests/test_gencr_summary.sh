@@ -56,24 +56,45 @@ run_gencr() { # [env assignments via env] ARGS...
 printed() { sed -n '/^========== GITHUB REVIEW COMMENT ==========$/,/^========== END REVIEW COMMENT ==========$/p' "$WORK/stdout" | sed '1d;$d'; }
 saved() { python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import gencr_summary as g; sys.stdout.write(g.extract(open(sys.argv[2]).read()))' "$REPO/bin" "$PKG/summary.md"; }
 
-# gen N JSON — a reviewer response from a spec: agent, verdict, agreement, peer, findings [{id,title,severity,fix,
-# evidence}], blockers [ids], dispositions {id: "status — evidence"}, disputes [lines].
+# gen N JSON — a contract-v2 reviewer response from a spec: verdict, agreement, peer, findings [{id,title,severity,fix,
+# evidence,introduced}], blockers [ids], dispositions {id: "status — evidence"} (accepted/disputed rows get the facets
+# of a reviewer that agrees with the author's severity: introduced yes, the author's severity in the answered report,
+# blocking as this reply's own blocker list says; a value that already has facets is written as given), withdrawn
+# [lines], supplemental [lines], disputes [lines], verification [lines].
 gen() {
-  python3 -B - "$MOCK_STATE/responses/$1" "$2" <<'EOF'
-import json, sys
-path, spec = sys.argv[1], json.loads(sys.argv[2])
+  python3 -B - "$MOCK_STATE/responses/$1" "$2" "$MOCK_STATE/responses" <<'EOF'
+import json, os, re, sys
+path, spec, responses = sys.argv[1], json.loads(sys.argv[2]), sys.argv[3]
+def severity_of(fid):
+    peer = spec.get("peer", "N/A")
+    source = os.path.join(responses, str(int(peer[:2]))) if peer != "N/A" else ""
+    text = open(source).read() if source and os.path.exists(source) else ""
+    m = re.search(r"^- \*\*%s .*\n(?:  .*\n)*?  - Severity: (.*)$" % re.escape(fid), text, re.M)
+    value = (m.group(1) if m else "high").lower()
+    return "critical" if ("blocker" in value or "critical" in value) else next(
+        (s for s in ("high", "medium", "low") if s in value), "high")
+blockers = spec.get("blockers", [])
 out = ["Report.", "", "## Findings"]
 for f in spec.get("findings", []):
     out.append("- **%s %s**" % (f["id"], f.get("title", "A finding")))
     fix = f.get("fix", "apply the fix").split("\n")
-    out += ["  - Severity: %s" % f.get("severity", "High"), "  - File: app.py:1", "  - Problem: problem text",
+    out += ["  - Severity: %s" % f.get("severity", "High"), "  - Introduced by this change: %s" % f.get("introduced", "yes"),
+            "  - File: app.py:1", "  - Problem: problem text",
             "  - Evidence: %s" % f.get("evidence", "EVIDENCE-SENTINEL observed"), "  - Expected vs actual: x vs y",
             "  - Tests: none", "  - Fix: " + fix[0]] + ["    " + line if line else "" for line in fix[1:]]
 if not spec.get("findings"):
     out.append("- None")
-out += ["", "## Disposition of peer findings"]
-out += ["- %s: %s" % (k, v) for k, v in spec.get("dispositions", {}).items()] or ["- None"]
-out += ["", "## Merge blockers"] + (["- " + b for b in spec.get("blockers", [])] or ["- None"])
+out += ["", "## Withdrawn findings"] + (["- " + w for w in spec.get("withdrawn", [])] or ["- None"])
+rows = []
+for k, v in spec.get("dispositions", {}).items():
+    m = re.match(r"^(accepted|disputed)( (?:—|-) .*)$", v)
+    if m:
+        v = "%s; introduced: yes; severity: %s; blocking: %s%s" % (m.group(1), severity_of(k.upper()),
+                                                                 "yes" if k.upper() in blockers else "no", m.group(2))
+    rows.append("- %s: %s" % (k, v))
+out += ["", "## Disposition of peer findings"] + (rows or ["- None"])
+out += ["", "## Merge blockers"] + (["- " + b for b in blockers] or ["- None"])
+out += ["", "## Supplemental objections"] + (["- " + s for s in spec.get("supplemental", [])] or ["- None"])
 out += ["", "## Outstanding disputed findings"] + (["- " + d for d in spec.get("disputes", [])] or ["- None"])
 if "verification" in spec:
     out += ["", "## Previous findings verification"] + ["- " + v for v in spec["verification"]]
@@ -94,38 +115,60 @@ gen 1 '{"verdict": "REQUEST CHANGES", "findings": [
   {"id": "CLAUDE-2", "title": "Low blocker", "severity": "Low", "fix": "add the missing test"},
   {"id": "CLAUDE-3", "title": "Medium blocker", "severity": "Medium", "fix": "validate input\nand reject empty values"}],
   "blockers": ["CLAUDE-2", "CLAUDE-3"]}'
-gen 2 "{\"verdict\": \"REQUEST CHANGES\", \"agreement\": \"YES\", \"peer\": \"$(rid 1 0 claude initial)\",
-  \"findings\": [{\"id\": \"CODEX-1\", \"title\": \"Codex blocker\", \"severity\": \"High\"}], \"blockers\": [\"CODEX-1\", \"CLAUDE-3\"],
-  \"dispositions\": {\"CLAUDE-1\": \"accepted — confirmed\", \"CLAUDE-2\": \"rejected — the test exists\", \"CLAUDE-3\": \"disputed — not reachable\"}}"
+ATTACK='"findings": [{"id": "CODEX-1", "title": "Codex blocker", "severity": "High"}], "blockers": ["CODEX-1", "CLAUDE-3"],
+  "dispositions": {"CLAUDE-1": "accepted — confirmed", "CLAUDE-2": "rejected — the test exists", "CLAUDE-3": "disputed — not reachable"}'
+PRIMARY_FINDINGS='{"id": "CLAUDE-1", "title": "High non-blocker", "severity": "High"},
+  {"id": "CLAUDE-2", "title": "Low blocker", "severity": "Low", "fix": "add the missing test"},
+  {"id": "CLAUDE-3", "title": "Medium blocker", "severity": "Medium", "fix": "validate input\nand reject empty values"}'
+gen 2 "{\"verdict\": \"REQUEST CHANGES\", \"agreement\": \"NO\", \"peer\": \"$(rid 1 0 claude initial)\", $ATTACK}"
+# The primary accepts CODEX-1 as a blocker; both keep their positions on CLAUDE-2/3 to the cap; the primary's last report
+# adds CLAUDE-4, which Codex therefore never assessed.
+for n in 3 5 7 9; do
+  case "$n" in 3) peer="$(rid 2 0 codex attack)" ;; 5) peer="$(rid 4 1 codex respond)" ;; 7) peer="$(rid 6 2 codex respond)" ;; 9) peer="$(rid 8 3 codex respond)" ;; esac
+  late=""; [ "$n" -eq 9 ] && late=', {"id": "CLAUDE-4", "title": "Late finding", "severity": "High"}'
+  gen "$n" "{\"verdict\": \"REQUEST CHANGES\", \"agreement\": \"NO\", \"peer\": \"$peer\", \"findings\": [$PRIMARY_FINDINGS$late],
+    \"blockers\": [\"CLAUDE-2\", \"CLAUDE-3\", \"CODEX-1\"], \"dispositions\": {\"CODEX-1\": \"accepted — confirmed\"}}"
+done
+for n in 4 6 8; do
+  case "$n" in 4) peer="$(rid 3 1 claude reconcile)" ;; 6) peer="$(rid 5 1 claude reconcile)" ;; 8) peer="$(rid 7 2 claude reconcile)" ;; esac
+  gen "$n" "{\"verdict\": \"REQUEST CHANGES\", \"agreement\": \"NO\", \"peer\": \"$peer\", $ATTACK}"
+done
 run_gencr --codex=attack
 BLOCK="$(printed)"
-check "local run: exit code and call count unchanged (REQUEST CHANGES, 2 calls)" eval '[ "$STATUS" -eq 10 ] && [ "$(calls)" -eq 2 ]'
+section() { printf '%s\n' "$BLOCK" | sed -n "/^### $1/,/^### /p" | sed '1d;/^### /d'; }
+check "local run: the primary's REQUEST CHANGES applies after the cap (exit 10, 9 calls)" eval '[ "$STATUS" -eq 10 ] && [ "$(calls)" -eq 9 ]'
 check "local run: the terminal prints the block between the GITHUB REVIEW COMMENT markers" \
   eval 'contains "$OUT" "========== GITHUB REVIEW COMMENT ==========" && contains "$OUT" "========== END REVIEW COMMENT ==========" && contains "$BLOCK" "## Code review: REQUEST CHANGES"'
 check "local run: the printed block is byte-identical to summary.md's block" eval '[ "$BLOCK" = "$(saved)" ]'
 check "local run: the report path is printed after the END marker, not inside the block" \
   eval '[ "$(sed -n "/^========== END REVIEW COMMENT ==========$/,\$p" "$WORK/stdout" | sed -n 2p)" = "Complete report: $(ls "$HOME/Documents/CodeReview/dev"/code-review-*.md | tail -n 1)" ] &&
         ! contains "$BLOCK" "$HOME" && ! contains "$BLOCK" "$WORK" && ! contains "$BLOCK" "/Documents/"'
-check "local run: the full report is not dumped (no evidence, no file list, no dispositions section)" \
-  eval '! contains "$OUT" "EVIDENCE-SENTINEL" && ! contains "$OUT" "## Files examined" && ! contains "$OUT" "problem text" && [ "$(printf "%s\n" "$OUT" | wc -l)" -lt 60 ]'
-check "local run: stderr keeps the final-verdict line" eval 'contains "$ERR" "gencr: final verdict: ❌ REQUEST CHANGES; report:"'
+check "local run: the full report is not dumped (no file list, no Problem text; evidence only for attacker objections)" \
+  eval '! contains "$OUT" "## Files examined" && ! contains "$OUT" "problem text" && contains "$(section "Attacker objections")" "EVIDENCE-SENTINEL" &&
+        ! printf "%s\n" "$BLOCK" | sed -n "/^### Merge blockers (primary reviewer)/,\$p" | grep -q "EVIDENCE-SENTINEL" && [ "$(printf "%s\n" "$OUT" | wc -l)" -lt 120 ]'
+check "local run: stderr keeps the final-verdict line, with the non-unanimous qualification" \
+  eval 'contains "$ERR" "gencr: final verdict: ❌ REQUEST CHANGES by primary reviewer — NOT UNANIMOUS; 2 attacker objections remain; report:"'
 check "minimal metadata: verdict, mode, reviewed SHA, actual models" \
   eval 'contains "$BLOCK" "- Mode: FRESH" && contains "$BLOCK" "- Reviewed commit: $HEAD_SHA" && contains "$BLOCK" "Claude: mock-claude-default; Codex: mock-codex-default" && ! contains "$BLOCK" "Run ID"'
-check "merge blockers first and ranked by severity, before other significant findings (low blocker before high non-blocker)" \
-  eval '[ "$(printf "%s\n" "$BLOCK" | grep -nE "^- \*\*(CODEX-1|CLAUDE-3|CLAUDE-2|CLAUDE-1)\*\*" | cut -d"*" -f3 | tr "\n" " ")" = "CODEX-1 CLAUDE-3 CLAUDE-2 CLAUDE-1 " ] &&
-        printf "%s\n" "$BLOCK" | sed -n "/^### Other significant findings/,\$p" | grep -q "CLAUDE-1"'
-check "every blocker is listed with the total count" eval 'contains "$BLOCK" "- Merge blockers: 3" && ! contains "$BLOCK" "this summary lists"'
+check "verdict qualification, both verdicts and the objection count come first" \
+  eval 'contains "$BLOCK" "- REQUEST CHANGES by primary reviewer — NOT UNANIMOUS; 2 attacker objections remain." && contains "$BLOCK" "- Verdicts: Claude (primary): REQUEST CHANGES; Codex (attacker): REQUEST CHANGES" && contains "$BLOCK" "- Attacker objections: 2"'
+check "attacker objections are listed first, ranked by severity (medium before low)" \
+  eval '[ "$(section "Attacker objections" | grep -oE "^- \*\*(CLAUDE|CODEX)-[0-9]+\*\*" | grep -oE "(CLAUDE|CODEX)-[0-9]+" | tr "\n" " ")" = "CLAUDE-3 CLAUDE-2 " ]'
+check "the primary's merge blockers are ranked by severity, before other significant findings" \
+  eval '[ "$(section "Merge blockers (primary reviewer)" | grep -oE "^- \*\*(CLAUDE|CODEX)-[0-9]+\*\*" | grep -oE "(CLAUDE|CODEX)-[0-9]+" | tr "\n" " ")" = "CODEX-1 CLAUDE-3 CLAUDE-2 " ] &&
+        section "Other significant findings" | grep -q "CLAUDE-1"'
+check "every primary blocker is counted with the total" eval 'contains "$BLOCK" "- Merge blockers (primary reviewer): 3" && ! contains "$BLOCK" "this summary lists"'
 check "blocker attribution is per reviewer, never 'confirmed'" \
   eval 'contains "$BLOCK" "**CLAUDE-3** Medium blocker (medium) — listed as a merge blocker by Claude and Codex" && ! contains "$BLOCK" "onfirmed"'
 check "finding-level assessments: rejected and disputed are shown, with resolve-or-settle wording" \
   eval 'contains "$BLOCK" "**CLAUDE-2** Low blocker (low) — listed as a merge blocker by Claude; Codex: rejected — resolve before merge: fix it or settle the dispute" &&
         contains "$BLOCK" "Codex: disputed — resolve before merge" && contains "$BLOCK" "**CLAUDE-1** High non-blocker (high) — reported by Claude; Codex: accepted"'
 check "a finding the other reviewer never saw is 'not assessed', never agreed" \
-  eval 'contains "$BLOCK" "**CODEX-1** Codex blocker (high) — listed as a merge blocker by Codex; not assessed by Claude"'
+  eval 'contains "$BLOCK" "**CLAUDE-4** Late finding (high) — reported by Claude; not assessed by Codex" && contains "$BLOCK" "- Not reassessed: 1 findings"'
 check "the recommended fix is complete and verbatim, including continuation lines (fenced)" \
   python3 -B -c 'import sys; sys.exit(0 if "  - Recommended fix:\n\n    ```\n    validate input\n    and reject empty values\n    ```\n" in sys.argv[1] else 1)' "$BLOCK"
-check "overall agreement is stated as such, not as per-finding agreement" \
-  eval 'contains "$BLOCK" "The reviewers reported overall agreement on the result; the position on each finding is shown with it."'
+check "the attacker's position on each objection is explicit (existence, blocking) with the primary's response" \
+  eval 'contains "$(section "Attacker objections")" "blocks merge — Claude: yes, Codex: —" && contains "$(section "Attacker objections")" "exists — Claude: asserted, Codex: rejected (opposed)"'
 
 # ── Assessments tied to the assessed version; unresolved reconciliation (9 calls, 3 rounds) ──
 
@@ -154,8 +197,8 @@ limit_run() { # FINAL_CLAUDE_FIX — claude-first, both REQUEST CHANGES, agreeme
 limit_run "remove the stored records before validation"
 check "limit run: still REQUEST CHANGES, exit 10, 9 calls, 3 rounds" \
   eval '[ "$STATUS" -eq 10 ] && [ "$(calls)" -eq 9 ] && [ "$(json_get "$PKG/metadata.json" "d[\"rounds\"]")" = 3 ]'
-check "limit run: non-agreement is stated even though no disputed findings were listed" \
-  eval 'contains "$BLOCK" "**Claude and Codex did not reach agreement**: the reconciliation limit (3 rounds) was reached with disagreement remaining. No specific disputed findings were listed by either reviewer."'
+check "limit run: the remaining disagreement is stated (not unanimous) even though no disputed rows were written" \
+  eval 'contains "$BLOCK" "- REQUEST CHANGES by primary reviewer — NOT UNANIMOUS; 2 attacker objections remain."'
 check "a changed finding: the peer's acceptance is labelled as of the earlier version" \
   eval 'contains "$BLOCK" "Codex: accepted an earlier version (report $(rid 7 2 claude reconcile)); the current version was not assessed by Codex"'
 limit_run "preserve existing records and validate input"
@@ -169,8 +212,9 @@ gen 1 '{"verdict": "APPROVED"}'
 gen 2 "{\"verdict\": \"APPROVED\", \"agreement\": \"YES\", \"peer\": \"$(rid 1 0 claude initial)\"}"
 run_gencr --codex=attack
 BLOCK="$(printed)"
-check "APPROVED: approval wording, no blockers, exit 0" \
-  eval '[ "$STATUS" -eq 0 ] && contains "$BLOCK" "## Code review: APPROVED" && contains "$BLOCK" "No merge blockers were reported." && contains "$BLOCK" "- Merge blockers: 0"'
+check "APPROVED by both: unanimous approval wording, no blockers, exit 0" \
+  eval '[ "$STATUS" -eq 0 ] && contains "$BLOCK" "## Code review: APPROVED" && contains "$BLOCK" "- APPROVED — unanimous: both reviewers approve and agree on every finding." &&
+        contains "$BLOCK" "No merge blockers were reported." && contains "$BLOCK" "- Merge blockers (primary reviewer): 0" && ! contains "$BLOCK" "NOT UNANIMOUS"'
 
 reset_mocks
 n=1
@@ -188,10 +232,13 @@ for step in "claude APPROVED N/A N/A" "codex RC NO $(rid 1 0 claude initial)" "c
 done
 run_gencr --codex=attack
 BLOCK="$(printed)"
-check "UNRESOLVED DISAGREEMENT: exit 11, both final verdicts and the non-agreement warning" \
-  eval '[ "$STATUS" -eq 11 ] && contains "$BLOCK" "## Code review: UNRESOLVED DISAGREEMENT" && contains "$BLOCK" "- Final verdicts: Claude: APPROVED; Codex: REQUEST CHANGES" && contains "$BLOCK" "did not reach agreement"'
-check "UNRESOLVED: disputed items are listed with attribution" \
-  eval 'contains "$BLOCK" "### Disputed or unresolved" && contains "$BLOCK" "- CODEX-1 is disputed by Claude (Codex)" && contains "$BLOCK" "Claude: rejected — resolve before merge"'
+check "primary APPROVED, attacker REQUEST CHANGES at the cap: APPROVED (exit 0), never unanimous, both verdicts shown" \
+  eval '[ "$STATUS" -eq 0 ] && contains "$BLOCK" "## Code review: APPROVED" && contains "$BLOCK" "- APPROVED by primary reviewer — NOT UNANIMOUS; 1 attacker objections remain." &&
+        contains "$BLOCK" "- Verdicts: Claude (primary): APPROVED; Codex (attacker): REQUEST CHANGES" && ! contains "$BLOCK" "unanimous: both" && ! contains "$BLOCK" "No merge blockers were reported"'
+check "primary APPROVED with objections: the attacker's finding, its evidence and the primary's response are shown" \
+  eval 'contains "$BLOCK" "### Attacker objections" && contains "$BLOCK" "**CODEX-1** Blocker (Codex'"'"'s finding)" && contains "$BLOCK" "EVIDENCE-SENTINEL" &&
+        contains "$BLOCK" "Primary response (Claude, report $(rid 9 3 claude reconcile)): not a defect" &&
+        contains "$BLOCK" "Codex'"'"'s latest statement (report $(rid 8 3 codex respond); answered later by Claude in report $(rid 9 3 claude reconcile)): is disputed by Claude"'
 
 reset_mocks
 gen 1 '{"verdict": "REQUEST CHANGES", "findings": [{"id": "CLAUDE-1", "title": "Solo"}], "blockers": ["CLAUDE-1"]}'
@@ -386,11 +433,11 @@ incremental_pair() { # CODEX_FIX
 }
 incremental_pair "validate input"
 check "shared lineage blocker: counted once, listed once, attributed to both reviewers" \
-  eval '[ "$STATUS" -eq 10 ] && contains "$BLOCK" "- Merge blockers: 1" && [ "$(printf "%s\n" "$BLOCK" | grep -c "^- \*\*CLAUDE-1\*\*")" -eq 1 ] &&
+  eval '[ "$STATUS" -eq 10 ] && contains "$BLOCK" "- Merge blockers (primary reviewer): 1" && [ "$(printf "%s\n" "$BLOCK" | grep -c "^- \*\*CLAUDE-1\*\*")" -eq 1 ] &&
         contains "$BLOCK" "listed as a merge blocker by Claude and Codex" && ! contains "$BLOCK" "definitions differ"'
 incremental_pair "drop the table first"
 check "shared lineage blocker with differing definitions: one entry, both fixes, the difference stated" \
-  eval '[ "$STATUS" -eq 10 ] && contains "$BLOCK" "- Merge blockers: 1" && contains "$BLOCK" "the reviewers'"'"' definitions differ" &&
+  eval '[ "$STATUS" -eq 10 ] && contains "$BLOCK" "- Merge blockers (primary reviewer): 1" && contains "$BLOCK" "the reviewers'"'"' definitions differ" &&
         contains "$BLOCK" "Recommended fix (Claude):" && contains "$BLOCK" "Recommended fix (Codex):" && contains "$BLOCK" "drop the table first" && contains "$BLOCK" "validate input"'
 
 # SUM-I3: every fix is in a literal fenced block; prose is escaped so GitHub renders the original characters.

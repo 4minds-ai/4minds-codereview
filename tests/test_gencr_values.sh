@@ -95,22 +95,47 @@ open(path, "w").write(s)
 EOF
 }
 
-# gen N JSON — a reviewer response from a spec: verdict, agreement, peer, findings [{id,title,severity,fix}],
-# blockers [ids], dispositions [lines after "- "], disputes [lines after "- "], verification [lines],
-# notes {label: value} (every Review notes label defaults to None).
+# gen N JSON — a contract-v2 reviewer response from a spec: verdict, agreement, peer, findings
+# [{id,title,severity,fix,introduced}], blockers [ids], dispositions [lines after "- "], withdrawn [lines], supplemental
+# [lines], disputes [lines], verification [lines], notes {label: value}. A disposition line without facets
+# ("ID: accepted — x", "ID (report R): disputed — x") gets the facets of a reviewer that agrees with the author's
+# severity: introduced yes, severity from the author's definition in the answered (or source) report, blocking as this
+# reply's own blocker list says.
 gen() {
-  python3 -B - "$MOCK_STATE/responses/$1" "$2" <<'EOF'
-import json, sys
-path, spec = sys.argv[1], json.loads(sys.argv[2])
+  python3 -B - "$MOCK_STATE/responses/$1" "$2" "$MOCK_STATE/responses" <<'EOF'
+import json, os, re, sys
+path, spec, responses = sys.argv[1], json.loads(sys.argv[2]), sys.argv[3]
+def severity_of(report_id, fid):
+    if not report_id or report_id == "N/A":
+        return "high"
+    source = os.path.join(responses, str(int(report_id[:2])))
+    text = open(source).read() if os.path.exists(source) else ""
+    m = re.search(r"^- \*\*%s .*\n(?:  .*\n)*?  - Severity: (.*)$" % re.escape(fid), text, re.M)
+    value = (m.group(1) if m else "high").lower()
+    return "critical" if ("blocker" in value or "critical" in value) else next(
+        (s for s in ("high", "medium", "low") if s in value), "high")
+blockers = spec.get("blockers", [])
+rows = []
+for d in spec.get("dispositions", []):
+    m = re.match(r"^(\S+)( \(report (\S+)\))?: (accepted|disputed)( (?:—|-) .*)$", d)
+    if m and "; introduced:" not in d:
+        fid = m.group(1).upper()
+        d = "%s%s: %s; introduced: yes; severity: %s; blocking: %s%s" % (
+            m.group(1), m.group(2) or "", m.group(4), severity_of(m.group(3) or spec.get("peer"), fid),
+            "yes" if fid in blockers else "no", m.group(5))
+    rows.append(d)
 out = ["Report.", "", "## Findings"]
 for f in spec.get("findings", []):
     out += ["- **%s %s**" % (f["id"], f.get("title", "A finding")), "  - Severity: %s" % f.get("severity", "High"),
+            "  - Introduced by this change: %s" % f.get("introduced", "yes"),
             "  - File: app.py:1", "  - Problem: problem text", "  - Evidence: evidence text",
             "  - Expected vs actual: x vs y", "  - Tests: none", "  - Fix: %s" % f.get("fix", "apply the fix")]
 if not spec.get("findings"):
     out.append("- None")
-out += ["", "## Disposition of peer findings"] + (["- " + d for d in spec.get("dispositions", [])] or ["- None"])
-out += ["", "## Merge blockers"] + (["- " + b for b in spec.get("blockers", [])] or ["- None"])
+out += ["", "## Withdrawn findings"] + (["- " + w for w in spec.get("withdrawn", [])] or ["- None"])
+out += ["", "## Disposition of peer findings"] + (["- " + d for d in rows] or ["- None"])
+out += ["", "## Merge blockers"] + (["- " + b for b in blockers] or ["- None"])
+out += ["", "## Supplemental objections"] + (["- " + s for s in spec.get("supplemental", [])] or ["- None"])
 out += ["", "## Outstanding disputed findings"] + (["- " + d for d in spec.get("disputes", [])] or ["- None"])
 if "verification" in spec:
     out += ["", "## Previous findings verification"] + ["- " + v for v in spec["verification"]]
@@ -121,6 +146,36 @@ out += ["", "VERDICT: " + spec["verdict"], "PEER-AGREEMENT: " + spec.get("agreem
         "PEER-REPORT: " + spec.get("peer", "N/A"), ""]
 open(path, "w").write("\n".join(out))
 EOF
+}
+# fill_cap ORDER FROM [PYTHON-EDIT] — replies FROM..9 repeat each reviewer's previous reply (call k-2) with its
+# PEER-REPORT pointing at the report it now answers: two reviewers that maintain their positions to the cap. The
+# optional edit (expression over s) is applied to each copy.
+fill_cap() {
+  local order="$1" k p a role phase rnd
+  if [ "$order" = claude ]; then p=claude a=codex; else p=codex a=claude; fi
+  for k in $(seq "$2" 9); do
+    if [ $((k % 2)) -eq 0 ]; then role="$a" phase=respond rnd=$(( (k - 2) / 2 )); else role="$p" phase=reconcile rnd=$(( k == 3 ? 1 : (k - 3) / 2 )); fi
+    python3 -B - "$MOCK_STATE/responses/$((k - 2))" "$MOCK_STATE/responses/$k" "$(fill_previous "$order" $((k - 1)))" "${3:-s}" <<'EOF'
+import re, sys
+src, dst, peer, expr = sys.argv[1:5]
+s = open(src, newline="").read()  # byte-exact copy: CR and other payload stay as written
+s = re.sub(r"(?m)^PEER-REPORT: .*$", "PEER-REPORT: " + peer, s)
+s = re.sub(r"(?m)^PEER-AGREEMENT: N/A$", "PEER-AGREEMENT: NO", s)
+s = eval(expr)
+open(dst, "w", newline="").write(s)
+EOF
+  done
+}
+# The report ID of call K in ORDER's schedule.
+fill_previous() {
+  local order="$1" k="$2" p a
+  if [ "$order" = claude ]; then p=claude a=codex; else p=codex a=claude; fi
+  case "$k" in
+    1) rid 1 0 "$p" initial ;;
+    2) rid 2 0 "$a" attack ;;
+    3) rid 3 1 "$p" reconcile ;;
+    *) if [ $((k % 2)) -eq 0 ]; then rid "$k" $(( (k - 2) / 2 )) "$a" respond; else rid "$k" $(( (k - 3) / 2 )) "$p" reconcile; fi ;;
+  esac
 }
 
 # gen_for ORDER N ROLE JSON — gen with the spec written for the claude-first order (role primary|adversary),
@@ -176,8 +231,8 @@ for order in claude codex; do
     eval '[ "$(json_get "$PKG/findings.json" "d[\"review_notes\"][\"$p\"][\"Verified clean\"]")" = "- The API key never appears in client errors.
 - The host is fixed and redirects are off.
 - Pagination caps and cursor-cycle detection hold." ]'
-  check "$order-first prompts: both reviewers get the same value rule, naming the three single-line fields" \
-    eval 'grep -qF "Severity, File and Duplicate of are each one line of text on the field line, with nothing below it." "$MOCK_STATE/call-1.stdin" &&
+  check "$order-first prompts: both reviewers get the same value rule, naming the four single-line fields" \
+    eval 'grep -qF "Severity, Introduced by this change, File and Duplicate of are each one line of text on the field line, with nothing below it." "$MOCK_STATE/call-1.stdin" &&
           [ "$(sed "/^===== YOUR ROLE =====\$/,\$d" "$MOCK_STATE/call-1.stdin")" = "$(sed "/^===== YOUR ROLE =====\$/,\$d" "$MOCK_STATE/call-2.stdin")" ]'
 done
 
@@ -205,10 +260,12 @@ for order in claude codex; do
   # The reconcile reply's Fix and the respond reply's Evidence become rich blocks; their notes become blocks too.
   edit_reply 3 "s.replace('  - Fix: apply the fix', '  - ' + '''$RICH''', 1).replace('- Unresolved risks: None', '- Unresolved risks:\n  - café — unverified\r\n  - second', 1)"
   edit_reply 4 "s.replace('  - Evidence: evidence text', '  - Evidence:\n        deeper first line (an indented code block)\n    - then a bullet', 1)"
+  # The respond reply changed CODEX-1's Evidence: the primary reassesses that version (its reply 3 again), then agreement.
+  fill_cap "$order" 5
   # shellcheck disable=SC2046
   run_gencr "rounds-$order" $(order_flags "$order")
-  check "$order-first rounds: block values in reconcile and respond replies are valid (exit 10, 4 calls)" \
-    eval '[ "$STATUS" -eq 10 ] && [ "$(calls)" -eq 4 ] && [ ! -e "$PKG/$(rid 3 1 "$p" reconcile).normalization.json" ]'
+  check "$order-first rounds: block values in reconcile and respond replies are valid (exit 10, 5 calls)" \
+    eval '[ "$STATUS" -eq 10 ] && [ "$(calls)" -eq 5 ] && [ ! -e "$PKG/$(rid 3 1 "$p" reconcile).normalization.json" ]'
   check "$order-first rounds: a fenced code block with blank lines is kept exactly in findings.json and the summary" \
     eval '[ "$(field_of "${PP}-1" "$p" fields Fix)" = "- Guard the call:
   \`\`\`python
@@ -234,7 +291,9 @@ for order in claude codex; do
   value_case "$order" "inline text, a blank line, then a block is rejected" "the Fix value must start on the line directly below its label" \
     "s.replace('  - Fix: synthetic fix 3', '  - Fix: synthetic fix 3\n\n    - late action', 1)"
   value_case "$order" "a block Severity is rejected" "${PP}-3: Severity must be a single line on its field line" \
-    "s.replace('  - Severity: Medium\n  - File: app.py:3', '  - Severity:\n    Medium\n  - File: app.py:3', 1)"
+    "s.replace('  - Severity: Medium\n  - Introduced by this change: yes\n  - File: app.py:3', '  - Severity:\n    Medium\n  - Introduced by this change: yes\n  - File: app.py:3', 1)"
+  value_case "$order" "a block Introduced by this change is rejected" "${PP}-3: Introduced by this change must be a single line on its field line" \
+    "s.replace('  - Introduced by this change: yes\n  - File: app.py:3', '  - Introduced by this change:\n    yes\n  - File: app.py:3', 1)"
   value_case "$order" "a File with a continuation is rejected" "${PP}-3: File must be a single line on its field line" \
     "s.replace('  - File: app.py:3', '  - File: app.py:3\n    and app.py:4', 1)"
   value_case "$order" "a line between the field and its block anchor is rejected" "is outside any field" \

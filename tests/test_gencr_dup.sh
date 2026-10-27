@@ -80,10 +80,16 @@ dup_report() { # findings-file dupcheck-file
     echo "## Findings"
     cat "$1"
     echo
+    echo "## Withdrawn findings"
+    echo "- None"
+    echo
     echo "## Disposition of peer findings"
     echo "- None"
     echo
     echo "## Merge blockers"
+    echo "- None"
+    echo
+    echo "## Supplemental objections"
     echo "- None"
     echo
     echo "## Outstanding disputed findings"
@@ -109,6 +115,7 @@ finding() { # id file duplicate-of
   cat <<EOF
 - **$1 Duplicates an existing implementation**
   - Severity: Medium
+  - Introduced by this change: yes
   - File: $2
   - Duplicate of: $3
   - Problem: the same slug normalization is implemented twice
@@ -554,10 +561,16 @@ open(os.path.join(sys.argv[1], "responses", "1"), "w").write("""r
 ## Findings
 - None
 
+## Withdrawn findings
+- None
+
 ## Disposition of peer findings
 - None
 
 ## Merge blockers
+- None
+
+## Supplemental objections
 - None
 
 ## Outstanding disputed findings

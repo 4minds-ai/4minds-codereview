@@ -6,6 +6,7 @@ Risk: High, primarily data integrity and sync completion.
 
 - **CODEX-1 First sync can overwrite a concurrently imported file**
   - Severity: 🔴 BLOCKER
+  - Introduced by this change: yes
   - File: app.py:11
   - Problem: The first sync allocates its id from a stale list and replaces whatever entry now has that id.
   - Evidence: (traced) Imports lock and allocate against live data; the sync does neither.
@@ -15,6 +16,7 @@ Risk: High, primarily data integrity and sync completion.
 
 - **CODEX-2 A failed handoff is reported as a successful sync**
   - Severity: High
+  - Introduced by this change: yes
   - File: app.py:12
   - Problem: The handoff result is ignored.
   - Evidence: (traced) The callback returns a bool that the caller drops.
@@ -24,6 +26,7 @@ Risk: High, primarily data integrity and sync completion.
 
 - **CODEX-3 Malformed responses can replace data with an empty snapshot**
   - Severity: High
+  - Introduced by this change: yes
   - File: app.py:13
   - Problem: A missing list becomes an empty, final page.
   - Evidence: (traced) `{}` parses to an empty final page, which is committed.
@@ -33,6 +36,7 @@ Risk: High, primarily data integrity and sync completion.
 
 - **CODEX-4 The time budget does not bound a response in flight**
   - Severity: Medium
+  - Introduced by this change: yes
   - File: app.py:14
   - Problem: The deadline is checked only between requests.
   - Evidence: (reasoned, not executed) No absolute timeout wraps a request.
@@ -42,6 +46,7 @@ Risk: High, primarily data integrity and sync completion.
 
 - **CODEX-5 A default configuration creates a sync that can never run**
   - Severity: High
+  - Introduced by this change: yes
   - File: app.py:15
   - Problem: Import accepts an empty configuration that scheduled runs reject.
   - Evidence: (traced) The import stores the raw configuration; the scheduler validates it strictly.
@@ -49,21 +54,24 @@ Risk: High, primarily data integrity and sync completion.
   - Tests: The two validations are tested separately.
   - Fix: Validate the configuration before it is stored.
 
+## Withdrawn findings
+- None
+
 ## Disposition of peer findings
 
-- CLAUDE-1: accepted — No test references the form; this blocks under the test rule.
+- CLAUDE-1: accepted; introduced: yes; severity: critical; blocking: yes — No test references the form; this blocks under the test rule.
 
-- CLAUDE-2: accepted — The panel map has no entry for the source.
+- CLAUDE-2: accepted; introduced: yes; severity: high; blocking: yes — The panel map has no entry for the source.
 
-- CLAUDE-3: accepted — The seed matches only the base filename.
+- CLAUDE-3: accepted; introduced: yes; severity: medium; blocking: no — The seed matches only the base filename.
 
-- CLAUDE-4: accepted — The bounded download falls back to the unbounded default.
+- CLAUDE-4: accepted; introduced: yes; severity: medium; blocking: no — The bounded download falls back to the unbounded default.
 
-- CLAUDE-5: accepted — The client reads `error`; the reason is in `message`.
+- CLAUDE-5: accepted; introduced: yes; severity: low; blocking: no — The client reads `error`; the reason is in `message`.
 
 - CLAUDE-6: rejected — The active import path gives a repeat import a distinct name, so no file is shared.
 
-- CLAUDE-7: accepted — Both docstrings contradict the code.
+- CLAUDE-7: accepted; introduced: yes; severity: low; blocking: no — Both docstrings contradict the code.
 
 ## Merge blockers
 
@@ -73,6 +81,9 @@ Risk: High, primarily data integrity and sync completion.
 - CODEX-2 — A failed handoff is recorded as a success.
 - CODEX-3 — Malformed responses can empty the data.
 - CODEX-5 — The default configuration produces an unusable sync.
+
+## Supplemental objections
+- None
 
 ## Outstanding disputed findings
 

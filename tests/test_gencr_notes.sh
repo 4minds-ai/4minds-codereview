@@ -94,22 +94,47 @@ open(path, "w").write(s)
 EOF
 }
 
-# gen N JSON — a reviewer response from a spec: verdict, agreement, peer, findings [{id,title,severity,fix}],
-# blockers [ids], dispositions [lines after "- "], disputes [lines after "- "], verification [lines],
-# notes {label: value} (every Review notes label defaults to None).
+# gen N JSON — a contract-v2 reviewer response from a spec: verdict, agreement, peer, findings
+# [{id,title,severity,fix,introduced}], blockers [ids], dispositions [lines after "- "], withdrawn [lines], supplemental
+# [lines], disputes [lines], verification [lines], notes {label: value}. A disposition line without facets
+# ("ID: accepted — x", "ID (report R): disputed — x") gets the facets of a reviewer that agrees with the author's
+# severity: introduced yes, severity from the author's definition in the answered (or source) report, blocking as this
+# reply's own blocker list says.
 gen() {
-  python3 -B - "$MOCK_STATE/responses/$1" "$2" <<'EOF'
-import json, sys
-path, spec = sys.argv[1], json.loads(sys.argv[2])
+  python3 -B - "$MOCK_STATE/responses/$1" "$2" "$MOCK_STATE/responses" <<'EOF'
+import json, os, re, sys
+path, spec, responses = sys.argv[1], json.loads(sys.argv[2]), sys.argv[3]
+def severity_of(report_id, fid):
+    if not report_id or report_id == "N/A":
+        return "high"
+    source = os.path.join(responses, str(int(report_id[:2])))
+    text = open(source).read() if os.path.exists(source) else ""
+    m = re.search(r"^- \*\*%s .*\n(?:  .*\n)*?  - Severity: (.*)$" % re.escape(fid), text, re.M)
+    value = (m.group(1) if m else "high").lower()
+    return "critical" if ("blocker" in value or "critical" in value) else next(
+        (s for s in ("high", "medium", "low") if s in value), "high")
+blockers = spec.get("blockers", [])
+rows = []
+for d in spec.get("dispositions", []):
+    m = re.match(r"^(\S+)( \(report (\S+)\))?: (accepted|disputed)( (?:—|-) .*)$", d)
+    if m and "; introduced:" not in d:
+        fid = m.group(1).upper()
+        d = "%s%s: %s; introduced: yes; severity: %s; blocking: %s%s" % (
+            m.group(1), m.group(2) or "", m.group(4), severity_of(m.group(3) or spec.get("peer"), fid),
+            "yes" if fid in blockers else "no", m.group(5))
+    rows.append(d)
 out = ["Report.", "", "## Findings"]
 for f in spec.get("findings", []):
     out += ["- **%s %s**" % (f["id"], f.get("title", "A finding")), "  - Severity: %s" % f.get("severity", "High"),
+            "  - Introduced by this change: %s" % f.get("introduced", "yes"),
             "  - File: app.py:1", "  - Problem: problem text", "  - Evidence: evidence text",
             "  - Expected vs actual: x vs y", "  - Tests: none", "  - Fix: %s" % f.get("fix", "apply the fix")]
 if not spec.get("findings"):
     out.append("- None")
-out += ["", "## Disposition of peer findings"] + (["- " + d for d in spec.get("dispositions", [])] or ["- None"])
-out += ["", "## Merge blockers"] + (["- " + b for b in spec.get("blockers", [])] or ["- None"])
+out += ["", "## Withdrawn findings"] + (["- " + w for w in spec.get("withdrawn", [])] or ["- None"])
+out += ["", "## Disposition of peer findings"] + (["- " + d for d in rows] or ["- None"])
+out += ["", "## Merge blockers"] + (["- " + b for b in blockers] or ["- None"])
+out += ["", "## Supplemental objections"] + (["- " + s for s in spec.get("supplemental", [])] or ["- None"])
 out += ["", "## Outstanding disputed findings"] + (["- " + d for d in spec.get("disputes", [])] or ["- None"])
 if "verification" in spec:
     out += ["", "## Previous findings verification"] + ["- " + v for v in spec["verification"]]
@@ -120,6 +145,36 @@ out += ["", "VERDICT: " + spec["verdict"], "PEER-AGREEMENT: " + spec.get("agreem
         "PEER-REPORT: " + spec.get("peer", "N/A"), ""]
 open(path, "w").write("\n".join(out))
 EOF
+}
+# fill_cap ORDER FROM [PYTHON-EDIT] — replies FROM..9 repeat each reviewer's previous reply (call k-2) with its
+# PEER-REPORT pointing at the report it now answers: two reviewers that maintain their positions to the cap. The
+# optional edit (expression over s) is applied to each copy.
+fill_cap() {
+  local order="$1" k p a role phase rnd
+  if [ "$order" = claude ]; then p=claude a=codex; else p=codex a=claude; fi
+  for k in $(seq "$2" 9); do
+    if [ $((k % 2)) -eq 0 ]; then role="$a" phase=respond rnd=$(( (k - 2) / 2 )); else role="$p" phase=reconcile rnd=$(( k == 3 ? 1 : (k - 3) / 2 )); fi
+    python3 -B - "$MOCK_STATE/responses/$((k - 2))" "$MOCK_STATE/responses/$k" "$(fill_previous "$order" $((k - 1)))" "${3:-s}" <<'EOF'
+import re, sys
+src, dst, peer, expr = sys.argv[1:5]
+s = open(src, newline="").read()  # byte-exact copy: CR and other payload stay as written
+s = re.sub(r"(?m)^PEER-REPORT: .*$", "PEER-REPORT: " + peer, s)
+s = re.sub(r"(?m)^PEER-AGREEMENT: N/A$", "PEER-AGREEMENT: NO", s)
+s = eval(expr)
+open(dst, "w", newline="").write(s)
+EOF
+  done
+}
+# The report ID of call K in ORDER's schedule.
+fill_previous() {
+  local order="$1" k="$2" p a
+  if [ "$order" = claude ]; then p=claude a=codex; else p=codex a=claude; fi
+  case "$k" in
+    1) rid 1 0 "$p" initial ;;
+    2) rid 2 0 "$a" attack ;;
+    3) rid 3 1 "$p" reconcile ;;
+    *) if [ $((k % 2)) -eq 0 ]; then rid "$k" $(( (k - 2) / 2 )) "$a" respond; else rid "$k" $(( (k - 3) / 2 )) "$p" reconcile; fi ;;
+  esac
 }
 
 # gen_for ORDER N ROLE JSON — gen with the spec written for the claude-first order (role primary|adversary),
@@ -133,6 +188,20 @@ one_call() { # DEV ORDER
   run_gencr "$1" $(order_flags "$2")
 }
 # A complete attack reply accepting the initial fixture's CLAUDE-1..7 (claude-first names).
+# primary_restates N — the primary's reply N: its initial report (all seven findings restated, contract v2) answering the
+# attacker's report N-1 and accepting the attacker's non-blocking finding with the author's facets.
+primary_restates() {
+  python3 -B - "$MOCK_STATE/responses/1" "$MOCK_STATE/responses/$1" "$(rid $(($1 - 1)) $(( $1 - 1 == 2 ? 0 : 1 )) "$2" "$( [ $(($1 - 1)) -eq 2 ] && echo attack || echo respond)")" "$3" <<'PY'
+import re, sys
+src, dst, peer, attacker_prefix = sys.argv[1:5]
+s = open(src, newline="").read()
+s = s.replace("## Disposition of peer findings\n- None",
+              "## Disposition of peer findings\n- %s-1: accepted; introduced: yes; severity: high; blocking: no — ok" % attacker_prefix, 1)
+s = re.sub(r"(?m)^PEER-AGREEMENT: N/A$", "PEER-AGREEMENT: YES", s)
+s = re.sub(r"(?m)^PEER-REPORT: N/A$", "PEER-REPORT: " + peer, s)
+open(dst, "w", newline="").write(s)
+PY
+}
 attack_reply() { # AGREEMENT [EXTRA_SPEC_JSON_MEMBERS]
   echo "{\"verdict\": \"REQUEST CHANGES\", \"agreement\": \"$1\", \"peer\": \"01-round0-claude-initial\",
     \"findings\": [{\"id\": \"CODEX-1\", \"title\": \"Peer finding\"}], \"blockers\": [\"CLAUDE-1\", \"CLAUDE-2\", \"CLAUDE-3\"],
@@ -167,10 +236,11 @@ for order in claude codex; do
   reset_mocks
   fixture 1 01-claude-initial-corrected "$order"
   gen_for "$order" 2 adversary "$(attack_reply YES)"
+  primary_restates 3 "$( [ "$order" = claude ] && echo codex || echo claude)" "$( [ "$order" = claude ] && echo CODEX || echo CLAUDE)"
   # shellcheck disable=SC2046
   run_gencr "corrected-$order" $(order_flags "$order")
-  check "$order-first corrected: the review completes (exit 10, 2 calls) with only the seven findings and CODEX-1" \
-    eval '[ "$STATUS" -eq 10 ] && [ "$(calls)" -eq 2 ] && [ "$(json_get "$PKG/findings.json" "len(d[\"final_findings\"])")" -eq 8 ]'
+  check "$order-first corrected: the review completes (exit 10, 3 calls: the primary answers CODEX-1) with only the seven findings and CODEX-1" \
+    eval '[ "$STATUS" -eq 10 ] && [ "$(calls)" -eq 3 ] && [ "$(json_get "$PKG/findings.json" "len(d[\"final_findings\"])")" -eq 8 ]'
   check "$order-first corrected: the full report keeps the notes, byte for byte, under the reviewer's final position" \
     eval 'grep -qxF "### Review notes" "$PKG/full-report.md" && grep -qxF "  - The response byte cap is checked before each chunk is appended." "$PKG/full-report.md" && grep -qxF -- "- Disproven claims: None" "$PKG/full-report.md"'
   check "$order-first corrected: findings.json keeps the notes per reviewer, separate from findings" \
@@ -240,7 +310,7 @@ for order in claude codex; do
   notes_ok "$order" "a title heading before the first section is allowed" \
     "s.replace('I\'m requesting changes.', '## Code Review: feature (widget sync)\n\nI\'m requesting changes.', 1)"
   notes_case "$order" "an unfenced finding heading inside a note is rejected (never a finding, never swallowed)" \
-    "line 96 inside the Other observations value looks like a finding heading" \
+    "inside the Other observations value looks like a finding heading" \
     "s.replace('- Other observations: None', '- Other observations: an example heading\n  - **${PP}-9 Not a finding**', 1)"
   notes_ok "$order" "a fenced finding heading inside a note stays note text (never a finding)" \
     "s.replace('- Other observations: None', '- Other observations: an example heading\n  \`\`\`\n  - **${PP}-9 Not a finding**\n  \`\`\`', 1)" \
@@ -270,8 +340,7 @@ dispute_case() {
   reset_mocks
   fixture 1 01-claude-initial-corrected "$order"
   gen_for "$order" 2 adversary "$(attack_reply NO ", \"disputes\": $4")"
-  gen_for "$order" 3 primary '{"verdict": "REQUEST CHANGES", "agreement": "YES", "peer": "02-round0-codex-attack",
-    "findings": [{"id": "CLAUDE-1", "title": "Kept"}], "blockers": ["CLAUDE-1"], "dispositions": ["CODEX-1: accepted — ok"]}'
+  primary_restates 3 "$( [ "$order" = claude ] && echo codex || echo claude)" "$( [ "$order" = claude ] && echo CODEX || echo CLAUDE)"
   # shellcheck disable=SC2046
   run_gencr "dispute-$order" $(order_flags "$order")
   if [ -z "$expect" ]; then
@@ -283,11 +352,12 @@ dispute_case() {
 for order in claude codex; do
   if [ "$order" = claude ]; then PP=CLAUDE A=Codex; else PP=CODEX A=Claude; fi
   ONLY="lists only disputes about a finding, one row per finding ID; observations go under '## Review notes'"
-  dispute_case "$order" "a multiline dispute about a finding is one disputed item" "" \
+  dispute_case "$order" "a multiline dispute about a finding is one dated statement (no opposing position: still unanimous)" "" \
     '["CLAUDE-2: the severity is disputed\n  - the panel is reachable from settings\n\n  - see CLAUDE-3 for the related path"]' \
-    '[ "$(grep -c "^- ${PP}-2: the severity is disputed" "$PKG/summary.md")" -eq 1 ] && ! grep -q "^- the panel is reachable" "$PKG/summary.md" && ! grep -q "^- see ${PP}-3" "$PKG/summary.md" &&
-     grep -qF -- "- ${PP}-2: the severity is disputed - the panel is reachable from settings - see ${PP}-3 for the related path (" "$PKG/summary.md" &&
-     contains "$(block)" "${PP}-2: the severity is disputed" && contains "$(block)" "the panel is reachable from settings"'
+    '[ "$(grep -c "Statement by ${A}, report $(rid 2 0 "$(echo "$A" | tr "[:upper:]" "[:lower:]")" attack) (dispute" "$PKG/full-report.md")" -eq 1 ] &&
+     grep -qF "): the severity is disputed" "$PKG/full-report.md" && grep -qxF "    - the panel is reachable from settings" "$PKG/full-report.md" &&
+     ! grep -q "^- the panel is reachable" "$PKG/summary.md" "$PKG/full-report.md" && ! grep -q "^- see ${PP}-3" "$PKG/summary.md" "$PKG/full-report.md" &&
+     [ "$(json_get "$PKG/metadata.json" "d[\"adjudication\"][\"unanimous\"]")" = True ]'
   dispute_case "$order" "an 'Unresolved risks:' row is rejected" "$ONLY" '["Unresolved risks: the external schema is unverified."]'
   dispute_case "$order" "a 'Still unverified' row with nested items is rejected" "$ONLY" \
     '["Still unverified (not counted as defects):\n  - whether reused IDs purge old content"]'
@@ -311,11 +381,15 @@ for order in claude codex; do
   gen_for "$order" 3 primary '{"verdict": "REQUEST CHANGES", "agreement": "NO", "peer": "02-round0-codex-attack", "findings": [{"id": "CLAUDE-1"}],
     "dispositions": ["CODEX-1: accepted — ok", "CODEX-2: disputed — unclear"], "blockers": ["CLAUDE-1", "CODEX-1"], "disputes": ["CODEX-2: not demonstrated"]}'
   gen_for "$order" 4 adversary '{"verdict": "REQUEST CHANGES", "agreement": "YES", "peer": "03-round1-claude-reconcile", "findings": [{"id": "CODEX-1"}],
-    "dispositions": ["CLAUDE-1: accepted — ok"], "blockers": ["CLAUDE-1", "CODEX-1"], "disputes": ["CODEX-2: withdrawn by me, recorded for the record"]}'
+    "withdrawn": ["CODEX-2: withdrawn — not demonstrated"], "dispositions": ["CLAUDE-1: accepted — ok"], "blockers": ["CLAUDE-1", "CODEX-1"],
+    "disputes": ["CODEX-2: withdrawn by me, recorded for the record"]}'
+  gen_for "$order" 5 primary '{"verdict": "REQUEST CHANGES", "agreement": "YES", "peer": "04-round1-codex-respond", "findings": [{"id": "CLAUDE-1"}],
+    "dispositions": ["CODEX-1: accepted — ok", "CODEX-2 (report 02-round0-codex-attack): withdrawn — agreed, never demonstrated"],
+    "blockers": ["CLAUDE-1", "CODEX-1"]}'
   # shellcheck disable=SC2046
   run_gencr "earlier-$order" $(order_flags "$order")
   check "$order-first: a dispute about a finding from an earlier report is valid and does not make it a current finding" \
-    eval '[ "$STATUS" -eq 10 ] && [ "$(calls)" -eq 4 ] && ! json_get "$PKG/findings.json" "[f[\"id\"] for f in d[\"final_findings\"]]" | grep -q "${AP}-2"'
+    eval '[ "$STATUS" -eq 10 ] && [ "$(calls)" -eq 5 ] && ! json_get "$PKG/findings.json" "[f[\"id\"] for f in d[\"final_findings\"]]" | grep -q "${AP}-2"'
 done
 
 # ── 4. Phases: reconciliation replies follow the same rules ──

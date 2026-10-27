@@ -286,10 +286,11 @@ check "explicit --fresh with ambiguous previous reviews still knows they exist (
 git -C "$TARGET" reset -q --hard pre-dag
 
 # ── 4. UNRESOLVED DISAGREEMENT: never automatic; explicit --incremental continues it ──
+# (New runs never produce UNRESOLVED DISAGREEMENT: these packages are made legacy — no adjudication object — first.)
 
 review "REQUEST CHANGES" dev11 --codex=attack
 U="$(newest dev11)"
-retouch "$U" 'm["outcome"] = "UNRESOLVED DISAGREEMENT"; m["final_verdict"] = "UNRESOLVED DISAGREEMENT"; m["rounds"] = 3'
+retouch "$U" 'm.pop("adjudication", None); f.pop("adjudication", None); m["outcome"] = "UNRESOLVED DISAGREEMENT"; m["final_verdict"] = "UNRESOLVED DISAGREEMENT"; m["rounds"] = 3'
 review APPROVED dev11 --codex=attack
 check "latest review UNRESOLVED (same HEAD): automatic mode stops for a decision, launches nothing" \
   eval '[ "$STATUS" -eq 1 ] && [ "$(calls)" -eq 0 ] && contains "$ERR" "ended UNRESOLVED DISAGREEMENT; gencr does not continue it automatically" &&
@@ -309,7 +310,7 @@ OLDER="$(newest dev12)"
 commit c9
 review "REQUEST CHANGES" dev12
 NEWER="$(newest dev12)"
-retouch "$NEWER" 'm["outcome"] = "UNRESOLVED DISAGREEMENT"; m["rounds"] = 3'
+retouch "$NEWER" 'm.pop("adjudication", None); f.pop("adjudication", None); m["outcome"] = "UNRESOLVED DISAGREEMENT"; m["rounds"] = 3'
 commit c10
 review APPROVED dev12
 check "an older APPROVED behind a newer UNRESOLVED: automatic mode stops, never falls back to the older review" \
@@ -323,7 +324,7 @@ review APPROVED devpin
 PIN="$(newest devpin)"
 cp -R "$PIN" "$(reports devpin)/review-unres2"
 retouch "$PIN" 'm["completed_at"] = "2030-01-01T00:00:00Z"'
-retouch "$(reports devpin)/review-unres2" 'm["run_id"] = "unres2"; m["outcome"] = "UNRESOLVED DISAGREEMENT"; m["rounds"] = 3; m["completed_at"] = "2031-01-01T00:00:00Z"'
+retouch "$(reports devpin)/review-unres2" 'm.pop("adjudication", None); f.pop("adjudication", None); m["run_id"] = "unres2"; m["outcome"] = "UNRESOLVED DISAGREEMENT"; m["rounds"] = 3; m["completed_at"] = "2031-01-01T00:00:00Z"'
 for extra in "" --print; do
   review APPROVED devpin --incremental --previous="$PIN" $extra
   check "--previous=<older> that covers HEAD${extra:+ ($extra)}: no-op, and it still warns about the newer UNRESOLVED review" \
@@ -367,7 +368,7 @@ review APPROVED devbar
 BOLD="$(newest devbar)"
 cp -R "$BOLD" "$(reports devbar)/review-newer-unresolved"
 retouch "$BOLD" 'm["completed_at"] = "2026-10-25T12:00:00Z"'
-retouch "$(reports devbar)/review-newer-unresolved" 'm["run_id"] = "newer-unresolved"; m["outcome"] = "UNRESOLVED DISAGREEMENT"; m["completed_at"] = "2026-10-25T13:00:00Z"
+retouch "$(reports devbar)/review-newer-unresolved" 'm.pop("adjudication", None); f.pop("adjudication", None); m["run_id"] = "newer-unresolved"; m["outcome"] = "UNRESOLVED DISAGREEMENT"; m["completed_at"] = "2026-10-25T13:00:00Z"
 m["previous_review"] = {"id": "earlier-review", "reviewed_sha": 123, "path": None}'
 review APPROVED devbar
 check "an older APPROVED behind a malformed newer UNRESOLVED (same commit): automatic mode stops, never covered by the older" \
@@ -389,7 +390,7 @@ check "a malformed UNRESOLVED package alone: automatic mode stops; it never rest
 review "REQUEST CHANGES" devdate
 DPKG="$(newest devdate)"
 cp -R "$DPKG" "$(reports devdate)/review-unres3"
-retouch "$(reports devdate)/review-unres3" 'm["run_id"] = "unres3"; m["outcome"] = "UNRESOLVED DISAGREEMENT"; m["completed_at"] = "2026-10-25T12:00:00Z"'
+retouch "$(reports devdate)/review-unres3" 'm.pop("adjudication", None); f.pop("adjudication", None); m["run_id"] = "unres3"; m["outcome"] = "UNRESOLVED DISAGREEMENT"; m["completed_at"] = "2026-10-25T12:00:00Z"'
 retouch "$DPKG" 'm["outcome"] = "APPROVED"; m["completed_at"] = "2026-99-99T99:99:99Z"'
 review APPROVED devdate
 check "an impossible completion date never outranks an UNRESOLVED review of the same commit: stop, launch nothing" \

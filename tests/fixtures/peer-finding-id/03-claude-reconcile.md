@@ -12,6 +12,7 @@ I accept five of Codex's six positions and withdraw CLAUDE-6. One point is still
 
 - **CLAUDE-1 New settings form has no tests**
   - Severity: 🔴 BLOCKER
+  - Introduced by this change: yes
   - File: app.py:1
   - Problem: The new settings form ships without tests.
   - Evidence: No test module references the form. Codex confirmed this independently and accepted it.
@@ -23,6 +24,7 @@ I accept five of Codex's six positions and withdraw CLAUDE-6. One point is still
 
 - **CLAUDE-2 The source card opens an empty panel**
   - Severity: High
+  - Introduced by this change: yes
   - File: app.py:2
   - Problem: The source is listed, but its configuration panel has no entry.
   - Evidence: (traced, not executed) The panel map has no key for the source. Codex accepted this.
@@ -32,6 +34,7 @@ I accept five of Codex's six positions and withdraw CLAUDE-6. One point is still
 
 - **CLAUDE-3 Re-creating the sync keeps a second snapshot**
   - Severity: Medium
+  - Introduced by this change: yes
   - File: app.py:3
   - Problem: Seeding matches only the base filename, so a rotated snapshot is kept forever.
   - Evidence: (traced, not executed) The rotated name is seeded as an upload and skipped by cleanup. Codex accepted this.
@@ -41,6 +44,7 @@ I accept five of Codex's six positions and withdraw CLAUDE-6. One point is still
 
 - **CLAUDE-4 Import holds the whole snapshot in memory**
   - Severity: Medium
+  - Introduced by this change: yes
   - File: app.py:4
   - Problem: The byte budget is checked only after the full download.
   - Evidence: (traced) The bounded download falls back to the unbounded default. Codex accepted this.
@@ -50,6 +54,7 @@ I accept five of Codex's six positions and withdraw CLAUDE-6. One point is still
 
 - **CLAUDE-5 Failure reasons never reach the user**
   - Severity: Low
+  - Introduced by this change: yes
   - File: app.py:5
   - Problem: The client reads the wrong response field for errors.
   - Evidence: The reason is in `message`; the client reads `error`. Codex accepted this.
@@ -59,6 +64,7 @@ I accept five of Codex's six positions and withdraw CLAUDE-6. One point is still
 
 - **CLAUDE-7 Docstrings contradict the code**
   - Severity: Low
+  - Introduced by this change: yes
   - File: app.py:7
   - Problem: - Two docstrings describe behaviour the code does not have.
     - The header has no logo.
@@ -69,6 +75,7 @@ I accept five of Codex's six positions and withdraw CLAUDE-6. One point is still
 
 - **CODEX-1 First sync can replace a file a concurrent import just added (accepted; tracked under Codex's ID)**
   - Severity: High
+  - Introduced by this change: yes
   - File: app.py:11
   - Problem: Without a prior manifest, the id is allocated from a stale list and the entry with that id is replaced.
   - Evidence: (traced) Imports serialize on a dataset lock and allocate against live data; the sync takes only its own lock.
@@ -78,6 +85,7 @@ I accept five of Codex's six positions and withdraw CLAUDE-6. One point is still
 
 - **CODEX-3 Malformed response bodies become an authoritative empty snapshot (accepted)**
   - Severity: High
+  - Introduced by this change: yes
   - File: app.py:13
   - Problem: A missing list becomes an empty, final page that is committed.
   - Evidence: (traced) `{}` renders as an empty snapshot, which replaces the old one.
@@ -87,6 +95,7 @@ I accept five of Codex's six positions and withdraw CLAUDE-6. One point is still
 
 - **CODEX-4 The time budget doesn't bound a response that is still streaming (accepted)**
   - Severity: Medium
+  - Introduced by this change: yes
   - File: app.py:14
   - Problem: The deadline is checked only before each request.
   - Evidence: (reasoned, not executed) Nothing wraps the request in an absolute timeout.
@@ -96,6 +105,7 @@ I accept five of Codex's six positions and withdraw CLAUDE-6. One point is still
 
 - **CODEX-5 A default configuration imports successfully but leaves a sync that can never run (accepted)**
   - Severity: High
+  - Introduced by this change: yes
   - File: app.py:15
   - Problem: Import accepts an empty configuration and stores it unchanged.
   - Evidence: (traced) The scheduler validates strictly and rejects it on every run.
@@ -103,13 +113,15 @@ I accept five of Codex's six positions and withdraw CLAUDE-6. One point is still
   - Tests: Nothing tests import followed by a scheduled run.
   - Fix: Canonicalize and validate the configuration before it is stored.
 
+## Withdrawn findings
+- CLAUDE-6: withdrawn — I accept Codex's rejection and withdraw the finding. The active import path gives a repeat import a distinct name.
+
 ## Disposition of peer findings
-- CODEX-1: accepted — Imports allocate against live data under the dataset lock; the sync allocates from a stale list and replaces by id. Codex rated it 🔴 BLOCKER; I rate it High because it needs a concurrent first sync, but I agree it blocks the merge.
-- CODEX-2: disputed — The defect is real, but every sync writer drops the handoff result, so it is a platform-wide gap rather than a blocker introduced here.
-- CODEX-3: accepted — A missing list becomes an empty final page that replaces the old snapshot. High, merge blocker.
-- CODEX-4: accepted — The deadline is checked only before requests. Medium, not blocking.
-- CODEX-5: accepted — The import stores the raw configuration and the scheduler rejects it. High, merge blocker.
-- CLAUDE-6 (Codex rejected it): I accept the rejection and withdraw the finding. The active import path gives a repeat import a distinct name.
+- CODEX-1: accepted; introduced: yes; severity: high; blocking: yes — Imports allocate against live data under the dataset lock; the sync allocates from a stale list and replaces by id. Codex rated it 🔴 BLOCKER; I rate it High because it needs a concurrent first sync, but I agree it blocks the merge.
+- CODEX-2: disputed; introduced: no; severity: high; blocking: no — The defect is real, but every sync writer drops the handoff result, so it is a platform-wide gap rather than a blocker introduced here.
+- CODEX-3: accepted; introduced: yes; severity: high; blocking: yes — A missing list becomes an empty final page that replaces the old snapshot. High, merge blocker.
+- CODEX-4: accepted; introduced: yes; severity: medium; blocking: no — The deadline is checked only before requests. Medium, not blocking.
+- CODEX-5: accepted; introduced: yes; severity: high; blocking: yes — The import stores the raw configuration and the scheduler rejects it. High, merge blocker.
 
 ## Merge blockers
 - CLAUDE-1
@@ -117,6 +129,9 @@ I accept five of Codex's six positions and withdraw CLAUDE-6. One point is still
 - CODEX-1
 - CODEX-3
 - CODEX-5
+
+## Supplemental objections
+- None
 
 ## Outstanding disputed findings
 - CODEX-2: we agree the defect exists; we disagree on whether it blocks this change. It doesn't change the verdict.

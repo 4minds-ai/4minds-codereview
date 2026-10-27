@@ -582,6 +582,9 @@ def cmd_publish(args):
                     identity = {}
                 if metadata is None:
                     pass
+                elif gencr_support.adjudication_problem(metadata, findings):
+                    # A malformed or inconsistent adjudication never publishes a verdict (no indirect approval).
+                    metadata, reason = None, "the review package %s" % gencr_support.adjudication_problem(metadata, findings)
                 elif str(identity.get("pr_number")) != str(args.pr_number):
                     metadata, reason = None, "the review package does not belong to pull request %s" % args.pr_number
                 elif identity.get("repository") != expected_repository(args.repo):
@@ -620,7 +623,13 @@ def cmd_publish(args):
             gh("-X", "PATCH", "repos/%s/issues/comments/%s" % (args.repo, newest[0]["id"]), body={"body": body})
         else:
             gh("-X", "POST", "repos/%s/issues/%s/comments" % (args.repo, args.pr_number), body={"body": body})
-        description = "%s (%s)" % (outcome, metadata.get("review_mode", ""))
+        adjudication = metadata.get("adjudication")
+        if adjudication and not adjudication.get("unanimous"):
+            # A primary-authority verdict: APPROVED stays a success status, visibly not unanimous.
+            description = "%s (%s)" % (gencr_support.gencr_summary.qualification(adjudication).rstrip("."),
+                                       metadata.get("review_mode", ""))
+        else:
+            description = "%s (%s)" % (outcome, metadata.get("review_mode", ""))
         context_name = STATUS_CONTEXT
         if args.backend == "mock":
             context_name, description = MOCK_STATUS_CONTEXT, "MOCK pipeline test, not a code review: " + description

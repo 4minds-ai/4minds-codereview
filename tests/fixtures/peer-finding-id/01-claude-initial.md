@@ -10,6 +10,7 @@ Acknowledged: read-only review. Nothing was executed; every claim below comes fr
 
 - **CLAUDE-1 New settings form has no tests**
   - Severity: 🔴 BLOCKER
+  - Introduced by this change: yes
   - File: app.py:1
   - Problem: The new settings form ships without tests.
   - Evidence: No test module references the form.
@@ -19,6 +20,7 @@ Acknowledged: read-only review. Nothing was executed; every claim below comes fr
 
 - **CLAUDE-2 The source card opens an empty panel**
   - Severity: High
+  - Introduced by this change: yes
   - File: app.py:2
   - Problem: The source is listed, but its configuration panel has no entry.
   - Evidence: (traced, not executed) The panel map has no key for the source.
@@ -28,6 +30,7 @@ Acknowledged: read-only review. Nothing was executed; every claim below comes fr
 
 - **CLAUDE-3 Re-creating the sync keeps a second snapshot**
   - Severity: Medium
+  - Introduced by this change: yes
   - File: app.py:3
   - Problem: Seeding matches only the base filename, so a rotated snapshot is kept forever.
   - Evidence: (traced, not executed) The rotated name is seeded as an upload and skipped by cleanup.
@@ -37,6 +40,7 @@ Acknowledged: read-only review. Nothing was executed; every claim below comes fr
 
 - **CLAUDE-4 Import holds the whole snapshot in memory**
   - Severity: Medium
+  - Introduced by this change: yes
   - File: app.py:4
   - Problem: The byte budget is checked only after the full download.
   - Evidence: (traced) The bounded download falls back to the unbounded default.
@@ -46,6 +50,7 @@ Acknowledged: read-only review. Nothing was executed; every claim below comes fr
 
 - **CLAUDE-5 Failure reasons never reach the user**
   - Severity: Low
+  - Introduced by this change: yes
   - File: app.py:5
   - Problem: The client reads the wrong response field for errors.
   - Evidence: The reason is in `message`; the client reads `error`.
@@ -55,6 +60,7 @@ Acknowledged: read-only review. Nothing was executed; every claim below comes fr
 
 - **CLAUDE-6 Repeat imports can overwrite a shared file**
   - Severity: Low
+  - Introduced by this change: yes
   - File: app.py:6
   - Problem: A fixed filename lets two entries share one stored file.
   - Evidence: (traced) Both imports write the same name.
@@ -64,6 +70,7 @@ Acknowledged: read-only review. Nothing was executed; every claim below comes fr
 
 - **CLAUDE-7 Docstrings contradict the code**
   - Severity: Low
+  - Introduced by this change: yes
   - File: app.py:7
   - Problem: Two docstrings describe behaviour the code does not have.
   - Evidence: Read of the cited lines.
@@ -71,12 +78,18 @@ Acknowledged: read-only review. Nothing was executed; every claim below comes fr
   - Tests: Not applicable.
   - Fix: Correct both docstrings.
 
+## Withdrawn findings
+- None
+
 ## Disposition of peer findings
 - None
 
 ## Merge blockers
 - CLAUDE-1
 - CLAUDE-2
+
+## Supplemental objections
+- None
 
 ## Outstanding disputed findings
 - None

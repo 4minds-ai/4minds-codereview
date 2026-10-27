@@ -14,3 +14,12 @@ one finding moved there explicitly — 01's "**Summary**" block (its unresolved 
 "Confirmed defects" line -> Other observations), 02's multi-ID "awaiting peer evaluation" row -> Other observations, and
 03's "Still unverified" list -> Unresolved risks. Findings, IDs, dispositions, merge blockers and the restated CODEX
 blocks (the defect these fixtures reproduce) are unchanged.
+
+Contract v2 migration (2026-10-26, explicit positions): every finding gained "Introduced by this change: yes"; each
+report gained empty "## Withdrawn findings" and "## Supplemental objections" sections; each accepted or disputed
+disposition row gained its facets — introduced, severity and blocking — taken from the original report: the author's
+severity unless the row's own text states another (03's CODEX-1: "I rate it High"; 03's CODEX-2: "a platform-wide gap
+rather than a blocker introduced here" -> introduced: no), and blocking from the row's own "## Merge blockers" list.
+03's prose line withdrawing CLAUDE-6 ("I accept the rejection and withdraw the finding") moved, with its words, to
+"## Withdrawn findings" as "- CLAUDE-6: withdrawn — ..." (contract v2 withdraws explicitly). Statuses, other rationale
+text, merge blockers and the restated CODEX blocks are unchanged.

@@ -82,26 +82,47 @@ pkg() { ls -td "$(reports_dir "$1")"/review-* 2>/dev/null | head -n 1; }
 full_report() { echo "$(pkg "$1")/full-report.md"; }
 arg_after() { grep -A1 -x -- "$2" "$MOCK_STATE/call-$1.args" | tail -n 1; }
 
-# queue N AGENT VERDICT AGREEMENT PEER_REPORT [FINDING_NUMBER] — scripted reply to the Nth
-# invocation. Each reviewer defines finding <AGENT>-<FINDING_NUMBER> (default 1).
+# queue N AGENT VERDICT AGREEMENT PEER_REPORT [FINDING_NUMBER|none] [PEER_FINDING_NUMBER] — scripted reply to the
+# Nth invocation (contract v2). Each reviewer defines finding <AGENT>-<FINDING_NUMBER> (default 1; "none": no finding
+# of its own). Its row on the peer's finding (when the previous reply defines it): AGREEMENT YES accepts it with the
+# author's exact facets (blocking only when this reply requests changes and the author lists it as a blocker);
+# NO disputes it.
 queue() {
   local n="$1" agent="$2" verdict="$3" agreement="$4" peer="$5" k="${6:-1}" up peer_up blockers disposition
+  local pk="${7:-${6:-1}}" own previous peer_blocks
+  [ "$pk" != none ] || pk=1
   up="$(echo "$agent" | tr '[:lower:]' '[:upper:]')"
   if [ "$up" = CLAUDE ]; then peer_up=CODEX; else peer_up=CLAUDE; fi
-  blockers="- None"; [ "$verdict" = "REQUEST CHANGES" ] && blockers="- ${up}-${k}"
-  disposition="- None"; [ "$peer" = "N/A" ] || disposition="- ${peer_up}-${k}: disputed, see evidence"
+  blockers=""; [ "$verdict" = "REQUEST CHANGES" ] && [ "$k" != none ] && blockers="- ${up}-${k}"
+  disposition="- None"
+  previous="$MOCK_STATE/responses/$((n - 1))"
+  if [ "$peer" != "N/A" ] && [ -f "$previous" ] && grep -q "^- \*\*${peer_up}-${pk} " "$previous"; then
+    if [ "$agreement" = YES ]; then
+      peer_blocks="$(sed -n '/^## Merge blockers$/,/^## /p' "$previous" | grep -c "^- ${peer_up}-${pk}$")"
+      if [ "$peer_blocks" -gt 0 ] && [ "$verdict" = "REQUEST CHANGES" ]; then
+        disposition="- ${peer_up}-${pk}: accepted; introduced: yes; severity: high; blocking: yes — verified"
+        blockers="${blockers:+$blockers
+}- ${peer_up}-${pk}"
+      else
+        disposition="- ${peer_up}-${pk}: accepted; introduced: yes; severity: high; blocking: no — verified"
+      fi
+    else
+      disposition="- ${peer_up}-${pk}: disputed; introduced: yes; severity: high; blocking: no — see evidence"
+    fi
+  fi
+  [ -n "$blockers" ] || blockers="- None"
+  if [ "$k" = none ]; then own="- None"; else own="- **${up}-${k} Example finding (marker ${k})**
+  - Severity: High"; fi
   cat > "$MOCK_STATE/responses/$n" <<EOF
 Report body MARKER-${n} from ${agent}.
 
 ## Findings
-- **${up}-${k} Example finding (marker ${n})**
-  - Severity: High
-  - File: src dir/app file.py:1
-  - Problem: example problem
-  - Evidence: example evidence
-  - Expected vs actual: expected x, actual y
-  - Tests: none detect it
-  - Fix: example fix
+${own}$( [ "$k" = none ] || printf '\n%s' "  - Introduced by this change: yes" "  - File: src dir/app file.py:1" \
+  "  - Problem: example problem" "  - Evidence: example evidence" "  - Expected vs actual: expected x, actual y" \
+  "  - Tests: none detect it" "  - Fix: example fix")
+
+## Withdrawn findings
+- None
 
 ## Disposition of peer findings
 ${disposition}
@@ -109,8 +130,11 @@ ${disposition}
 ## Merge blockers
 ${blockers}
 
+## Supplemental objections
+- None
+
 ## Outstanding disputed findings
-- ${up}-${k}: DISPUTE-${n} raised by ${agent}
+$( [ "$k" = none ] && echo "- None" || echo "- ${up}-${k}: DISPUTE-${n} raised by ${agent}")
 
 ## Review notes
 - Verified clean: None
@@ -127,6 +151,43 @@ EOF
 }
 # A single-reviewer reply: its peer sections are empty.
 queue_single() { queue "$1" "$2" "$3" N/A N/A "${4:-1}"; }
+# v2_reply N FINDINGS WITHDRAWN DISPOSITIONS BLOCKERS VERDICT AGREEMENT PEER_REPORT — a hand-written contract-v2 reply
+# (each section's lines as given; "- None" for an empty section).
+v2_reply() {
+  cat > "$MOCK_STATE/responses/$1" <<REPLY
+Scripted reply $1.
+
+## Findings
+$2
+
+## Withdrawn findings
+$3
+
+## Disposition of peer findings
+$4
+
+## Merge blockers
+$5
+
+## Supplemental objections
+- None
+
+## Outstanding disputed findings
+- None
+
+## Review notes
+- Verified clean: None
+- Unresolved risks: None
+- Disproven claims: None
+- Test gaps: None
+- Out-of-scope ownership changes: None
+- Other observations: None
+
+VERDICT: $6
+PEER-AGREEMENT: $7
+PEER-REPORT: $8
+REPLY
+}
 # Adds a "## Previous findings verification" section: verify N "ID: status — evidence" ...
 verify() {
   local n="$1" file line
@@ -270,7 +331,7 @@ reset_mocks
 run_gencr a1 --version=2 --codex=attack --print; printed="$OUT"
 check "adversarial --print launches nothing and writes nothing" eval '[ "$(calls)" -eq 0 ] && [ ! -e "$HOME/Documents/CodeReview/a1" ]'
 queue 1 claude APPROVED N/A N/A
-queue 2 codex APPROVED YES "$(rid 1 0 claude initial)"
+queue 2 codex APPROVED YES "$(rid 1 0 claude initial)" none
 queue 3 claude APPROVED YES "$(rid 2 0 codex attack)"
 run_gencr a1 --version=2 --codex=attack
 check "adversarial --print shows exactly the prompt the first reviewer receives" [ "$printed" = "$(cat "$MOCK_STATE/call-1.stdin")" ]
@@ -307,18 +368,18 @@ check "no model flag is passed when none was requested" eval '! grep -qx -- --mo
 # 4b. Both request changes with aligned findings at round 0.
 reset_mocks
 queue 1 claude "REQUEST CHANGES" N/A N/A
-queue 2 codex "REQUEST CHANGES" YES "$(rid 1 0 claude initial)"
+queue 2 codex "REQUEST CHANGES" YES "$(rid 1 0 claude initial)" none
 run_gencr a2 --codex=attack
-check "both REQUEST CHANGES, aligned: stops after two calls, exit 10" \
-  eval '[ "$STATUS" -eq 10 ] && [ "$(calls)" -eq 2 ] && file_contains "$(full_report a2)" "- Final Verdict: REQUEST CHANGES" && file_contains "$(full_report a2)" "materially aligned"'
+check "both REQUEST CHANGES, every position agrees: stops after two calls, exit 10" \
+  eval '[ "$STATUS" -eq 10 ] && [ "$(calls)" -eq 2 ] && file_contains "$(full_report a2)" "- Final Verdict: REQUEST CHANGES" && file_contains "$(full_report a2)" "every explicit position agree"'
 
 # 4c. Different findings: reconciliation begins; agreement in round 1.
 reset_mocks
 queue 1 claude "REQUEST CHANGES" N/A N/A
-queue 2 codex "REQUEST CHANGES" NO "$(rid 1 0 claude initial)"
+queue 2 codex "REQUEST CHANGES" YES "$(rid 1 0 claude initial)"
 queue 3 claude "REQUEST CHANGES" YES "$(rid 2 0 codex attack)"
 run_gencr a3 --codex=attack
-check "different findings: reconciliation starts, agreement in round 1 stops it" \
+check "a new attacker finding: the primary must answer it; agreement in round 1 stops the review" \
   eval '[ "$(calls)" -eq 3 ] && file_contains "$(full_report a3)" "- Reconciliation Rounds: 1 (maximum 3)"'
 check "round 1 handoff tells Claude to answer Codex's report and keeps the disputes" \
   eval 'file_contains "$MOCK_STATE/call-3.stdin" "- Report to respond to: $(rid 2 0 codex attack)" && file_contains "$MOCK_STATE/call-3.stdin" "DISPUTE-2 raised by codex"'
@@ -331,9 +392,10 @@ queue 3 claude APPROVED NO "$(rid 2 0 codex attack)"
 queue 4 codex "REQUEST CHANGES" NO "$(rid 3 1 claude reconcile)"
 queue 5 claude APPROVED NO "$(rid 4 1 codex respond)"
 queue 6 codex APPROVED YES "$(rid 5 1 claude reconcile)"
+queue 7 claude APPROVED YES "$(rid 6 2 codex respond)"
 run_gencr a4 --codex=attack
-check "conflicting verdicts reconcile until agreement in round 2" \
-  eval '[ "$STATUS" -eq 0 ] && [ "$(calls)" -eq 6 ] && file_contains "$(full_report a4)" "- Final Verdict: APPROVED" && file_contains "$(full_report a4)" "- Reconciliation Rounds: 2 (maximum 3)"'
+check "conflicting verdicts reconcile until the primary's round-2 response agrees with every position" \
+  eval '[ "$STATUS" -eq 0 ] && [ "$(calls)" -eq 7 ] && file_contains "$(full_report a4)" "- Final Verdict: APPROVED" && file_contains "$(full_report a4)" "- Reconciliation Rounds: 2 (maximum 3)"'
 
 # 4e/4f. Disagreement through round 3, both starting orders; models stay bound to agents.
 limit_run() { # dev primary adversary options...
@@ -360,7 +422,7 @@ for order in "claude codex --version=2 --codex=attack" "codex claude --version=2
   shift 2
   limit_run "$dev" "$p" "$a" "$@" --claude-model=claude-x --codex-model codex-y
   agents="$(for n in 1 2 3 4 5 6 7 8 9; do cat "$MOCK_STATE/call-$n.agent" 2>/dev/null; done | tr '\n' ' ')"
-  check "$p-first: exactly 9 invocations, no fourth round, exit 11" eval '[ "$(calls)" -eq 9 ] && [ "$STATUS" -eq 11 ]'
+  check "$p-first: exactly 9 invocations, no fourth round; the primary's APPROVED applies (exit 0)" eval '[ "$(calls)" -eq 9 ] && [ "$STATUS" -eq 0 ]'
   check "$p-first: invocation order alternates, primary evaluates last" [ "$agents" = "$p $a $p $a $p $a $p $a $p " ]
   rounds="$(for n in 1 2 3 4 5 6 7 8 9; do sed -n "s/^- Current reconciliation round: \([0-9]*\).*/\1/p" "$MOCK_STATE/call-$n.stdin"; done | tr '\n' ' ')"
   check "$p-first: round counter is never reset across handoffs" [ "$rounds" = "0 0 1 1 1 2 2 3 3 " ]
@@ -385,7 +447,8 @@ for order in "claude codex --version=2 --codex=attack" "codex claude --version=2
   report="$(full_report "$dev")"
   check "$p-first: header shows both requested models" \
     eval 'file_contains "$report" "- Claude Model: claude-x" && file_contains "$report" "- Codex Model: codex-y"'
-  check "$p-first: limit report is UNRESOLVED DISAGREEMENT, never approval" file_contains "$report" "- Final Verdict: UNRESOLVED DISAGREEMENT"
+  check "$p-first: limit report is the primary's APPROVED, never unanimous, never UNRESOLVED DISAGREEMENT" \
+    eval 'file_contains "$report" "- Final Verdict: APPROVED" && file_contains "$report" "APPROVED by primary reviewer — NOT UNANIMOUS" && ! file_contains "$report" "UNRESOLVED DISAGREEMENT"'
   check "$p-first: limit report records the round limit" file_contains "$report" "reconciliation limit reached (3 of 3 rounds)"
   check "$p-first: limit report preserves both reviewers' disputed and blocking findings" \
     eval 'file_contains "$report" "DISPUTE-9 raised by $p" && file_contains "$report" "DISPUTE-8 raised by $a" && file_contains "$report" "- $(echo "$a" | tr a-z A-Z)-1"'
@@ -442,12 +505,13 @@ EOF
 codex_undefined_blocker() { edit_in_place "$MOCK_STATE/responses/2" 's/^- None$/- CODEX-7/; s/^VERDICT: APPROVED/VERDICT: REQUEST CHANGES/'; }
 codex_missing_field() { edit_in_place "$MOCK_STATE/responses/2" '/^  - Evidence:/d'; }
 codex_peer_prefix() { edit_in_place "$MOCK_STATE/responses/2" 's/^- \*\*CODEX-1 /- **CLAUDE-9 /'; }
-codex_no_disposition() { edit_in_place "$MOCK_STATE/responses/2" 's/^- CLAUDE-1: disputed, see evidence$/- None/'; }
+codex_no_disposition() { edit_in_place "$MOCK_STATE/responses/2" 's/^- CLAUDE-1: accepted; .*$/- None/'; }
 codex_untagged_finding() { edit_in_place "$MOCK_STATE/responses/2" 's/^- \*\*CODEX-1 Example/- Example/'; }
 codex_blank_field() { edit_in_place "$MOCK_STATE/responses/2" 's/^  - Evidence: .*/  - Evidence:/'; }
 codex_space_field() { edit_in_place "$MOCK_STATE/responses/2" 's/^  - File: .*/  - File:    /'; }
-codex_bare_disposition() { edit_in_place "$MOCK_STATE/responses/2" 's/^- CLAUDE-1: disputed, see evidence$/- CLAUDE-1/'; }
-codex_no_rationale() { edit_in_place "$MOCK_STATE/responses/2" 's/^- CLAUDE-1: disputed, see evidence$/- CLAUDE-1: accepted/'; }
+codex_bare_disposition() { edit_in_place "$MOCK_STATE/responses/2" 's/^- CLAUDE-1: accepted; .*$/- CLAUDE-1/'; }
+codex_no_rationale() { edit_in_place "$MOCK_STATE/responses/2" 's/^- CLAUDE-1: accepted; .*$/- CLAUDE-1: accepted/'; }
+codex_no_facets() { edit_in_place "$MOCK_STATE/responses/2" 's/^- CLAUDE-1: accepted; .*$/- CLAUDE-1: accepted — verified/'; }
 claude_is_error() { touch "$MOCK_STATE/error-1"; }
 failure_case "a failed Codex launch is reported, not skipped (exit 21)" "Codex exited with status 3" 21 codex_fails
 failure_case "an empty Codex report is rejected (exit 21)" "Codex returned an empty report" 21 codex_empty
@@ -463,12 +527,13 @@ failure_case "a ghost merge blocker with no findings is rejected" "each merge bl
 failure_case "a merge blocker ID that no report defines is rejected" "merge blocker CODEX-7 is not a finding defined in this review" 20 codex_undefined_blocker
 failure_case "a finding without its Evidence field is rejected" "finding CODEX-1 is missing the field(s): Evidence" 20 codex_missing_field
 failure_case "a finding defined with the other reviewer's prefix is rejected" "each finding must start with a bold CODEX-<n> ID" 20 codex_peer_prefix
-failure_case "a report that skips a peer finding's disposition is rejected" "has no '- CLAUDE-1: accepted|rejected|disputed" 20 codex_no_disposition
+failure_case "a report that skips a peer finding's disposition is rejected" "has no row for CLAUDE-1" 20 codex_no_disposition
 failure_case "a finding without an ID is rejected" "each finding must start with a bold CODEX-<n> ID" 20 codex_untagged_finding
 failure_case "a finding with an empty Evidence value is rejected" "finding CODEX-1 has an empty Evidence field" 20 codex_blank_field
 failure_case "a finding with a whitespace-only File value is rejected" "finding CODEX-1 has an empty File field" 20 codex_space_field
-failure_case "a bare peer ID without a disposition is rejected" "has no '- CLAUDE-1: accepted|rejected|disputed" 20 codex_bare_disposition
-failure_case "a disposition without supporting evidence is rejected" "has no '- CLAUDE-1: accepted|rejected|disputed" 20 codex_no_rationale
+failure_case "a bare peer ID without a disposition is rejected" "is not a valid entry: - CLAUDE-1" 20 codex_bare_disposition
+failure_case "a disposition without facets or supporting evidence is rejected" "every facet is required" 20 codex_no_rationale
+failure_case "a contract-v1 row (status and evidence, no facets) is rejected in contract v2" "every facet is required" 20 codex_no_facets
 
 reset_mocks
 queue 1 claude APPROVED N/A N/A
@@ -607,6 +672,7 @@ INC_DIR="$WORK/inc reports"
 reset_mocks
 queue 1 claude "REQUEST CHANGES" N/A N/A
 queue 2 codex "REQUEST CHANGES" YES "$(rid 1 0 claude initial)"
+queue 3 claude "REQUEST CHANGES" YES "$(rid 2 0 codex attack)"
 run_gencr inc --codex=attack --output-dir="$INC_DIR" --pr-number=42
 FRESH_PKG="$(ls -d "$INC_DIR"/review-*)"
 FRESH_ID="$(json_get "$FRESH_PKG/metadata.json" 'd["run_id"]')"
@@ -662,6 +728,7 @@ Codex carries Claude's finding.
 ## Findings
 - **CLAUDE-1 Example finding still present**
   - Severity: High
+  - Introduced by this change: yes
   - File: src dir/app file.py:1
   - Problem: still broken
   - Evidence: line 1
@@ -669,11 +736,17 @@ Codex carries Claude's finding.
   - Tests: none
   - Fix: fix it
 
+## Withdrawn findings
+- None
+
 ## Disposition of peer findings
 - None
 
 ## Merge blockers
 - CLAUDE-1
+
+## Supplemental objections
+- None
 
 ## Outstanding disputed findings
 - None
@@ -744,72 +817,40 @@ run_gencr inc --codex=review --incremental --output-dir="$INC_DIR" --pr-number=4
 check "without --previous, the latest compatible review is selected (here it already covers HEAD: nothing to review)" \
   eval '[ "$STATUS" -eq 0 ] && contains "$ERR" "no new review needed: review $(json_get "$CARRY_PKG/metadata.json" "d[\"run_id\"]") (verdict REQUEST CHANGES) already covers HEAD" && [ "$(calls)" -eq 0 ]'
 
-# A blocker defined in an earlier round and only cited in the final reports stays open and must be
-# verified by the next incremental review.
+# Contract v2: leaving one's own finding out of a later report is never a withdrawal; the report is invalid.
+reset_mocks
+queue 1 claude "REQUEST CHANGES" N/A N/A
+v2_reply 2 "- None" "- None" "- CLAUDE-1: disputed; introduced: yes; severity: high; blocking: yes — the guard is reachable" \
+  "- CLAUDE-1" "REQUEST CHANGES" NO "$(rid 1 0 claude initial)"
+v2_reply 3 "- None" "- None" "- None" "- None" APPROVED NO "$(rid 2 0 codex attack)"
+run_gencr omitted --codex=attack --output-dir="$WORK/omitted reports"
+check "a finding left out of the author's later report (not withdrawn) makes that report invalid: INCOMPLETE" \
+  eval '[ "$STATUS" -eq 20 ] && contains "$ERR" "your finding CLAUDE-1" && contains "$ERR" "leaving it out is not a withdrawal"'
+
+# A blocker its author withdrew while the other reviewer keeps its claim stays open with its original definition,
+# and the next incremental review must verify it.
 ORPHAN_DIR="$WORK/orphan reports"
 reset_mocks
 queue 1 claude "REQUEST CHANGES" N/A N/A
-cat > "$MOCK_STATE/responses/2" <<EOF
-Codex disputes but keeps the blocker.
-
-## Findings
-- None
-
-## Disposition of peer findings
-- CLAUDE-1: disputed — the guard is reachable
-
-## Merge blockers
-- CLAUDE-1
-
-## Outstanding disputed findings
-- None
-
-## Review notes
-- Verified clean: None
-- Unresolved risks: None
-- Disproven claims: None
-- Test gaps: None
-- Out-of-scope ownership changes: None
-- Other observations: None
-
-VERDICT: REQUEST CHANGES
-PEER-AGREEMENT: NO
-PEER-REPORT: $(rid 1 0 claude initial)
-EOF
-cat > "$MOCK_STATE/responses/3" <<EOF
-Claude keeps CLAUDE-1 without restating it.
-
-## Findings
-- None
-
-## Disposition of peer findings
-- None
-
-## Merge blockers
-- CLAUDE-1
-
-## Outstanding disputed findings
-- None
-
-## Review notes
-- Verified clean: None
-- Unresolved risks: None
-- Disproven claims: None
-- Test gaps: None
-- Out-of-scope ownership changes: None
-- Other observations: None
-
-VERDICT: REQUEST CHANGES
-PEER-AGREEMENT: YES
-PEER-REPORT: $(rid 2 0 codex attack)
-EOF
+v2_reply 2 "- None" "- None" "- CLAUDE-1: accepted; introduced: yes; severity: critical; blocking: yes — reachable, and worse than stated" \
+  "- CLAUDE-1" "REQUEST CHANGES" NO "$(rid 1 0 claude initial)"
+for n in 3 5 7 9; do
+  if [ "$n" -eq 3 ]; then answered="$(rid 2 0 codex attack)"; else answered="$(rid $((n - 1)) $(( (n - 3) / 2 )) codex respond)"; fi
+  v2_reply "$n" "- None" "- CLAUDE-1: withdrawn — the guard is unreachable after the early return" "- None" "- None" \
+    APPROVED NO "$answered"
+done
+for n in 4 6 8; do
+  v2_reply "$n" "- None" "- None" \
+    "- CLAUDE-1 (report $(rid 1 0 claude initial)): accepted; introduced: yes; severity: critical; blocking: yes — still reachable through retry()" \
+    "- CLAUDE-1" "REQUEST CHANGES" NO "$(rid $((n - 1)) $(( n < 6 ? 1 : (n - 4) / 2 )) claude reconcile)"
+done
 run_gencr orphan --codex=attack --output-dir="$ORPHAN_DIR"
 ORPHAN_PKG="$(ls -d "$ORPHAN_DIR"/review-*)"
-check "a final blocker defined only in an earlier round is kept as an open finding" \
-  eval '[ "$STATUS" -eq 10 ] && [ "$(json_get "$ORPHAN_PKG/findings.json" "[(f[\"id\"], f[\"blocker\"]) for f in d[\"final_findings\"]]")" = "[('"'"'CLAUDE-1'"'"', True)]" ]'
+check "a withdrawn finding the other reviewer keeps as a blocker stays open (primary APPROVED, not unanimous)" \
+  eval '[ "$STATUS" -eq 0 ] && [ "$(calls)" -eq 9 ] && [ "$(json_get "$ORPHAN_PKG/findings.json" "[(f[\"id\"], f[\"blocker\"]) for f in d[\"final_findings\"]]")" = "[('"'"'CLAUDE-1'"'"', True)]" ]'
 for f in "$ORPHAN_PKG/full-report.md" "$ORPHAN_DIR/code-review-$(json_get "$ORPHAN_PKG/metadata.json" 'd["run_id"]').md"; do
-  check "the earlier-round blocker keeps its full evidence and provenance in $(basename "$f")" \
-    eval 'file_contains "$f" "- **CLAUDE-1 Example finding (marker 1)** — merge blocker" && file_contains "$f" "  - Problem: example problem" && file_contains "$f" "  - Evidence: example evidence" && file_contains "$f" "an earlier report; cited as a merge blocker"'
+  check "the withdrawn-but-kept blocker keeps its full evidence and provenance in $(basename "$f")" \
+    eval 'file_contains "$f" "- **CLAUDE-1 Example finding (marker 1)** — merge blocker" && file_contains "$f" "  - Problem: example problem" && file_contains "$f" "  - Evidence: example evidence" && file_contains "$f" "withdrawn by Claude in report $(rid 3 1 claude reconcile)" && file_contains "$f" "kept open by Codex"'
 done
 echo 'print("unrelated")' > "$TARGET/unrelated.py"
 git -C "$TARGET" add . && git -C "$TARGET" commit -qm "unrelated change"
@@ -864,7 +905,7 @@ check "default models: requested is recorded as the CLI configured default" \
 
 reset_mocks
 queue 1 claude APPROVED N/A N/A
-queue 2 codex APPROVED YES "$(rid 1 0 claude initial)"
+queue 2 codex APPROVED YES "$(rid 1 0 claude initial)" none
 echo "anthropic.claude-opus-x-v1" > "$MOCK_STATE/model-1"
 run_gencr m-claude --codex=attack --claude-model=opus
 P="$(pkg m-claude)"
@@ -891,7 +932,7 @@ check "metadata keeps each invocation's actual model and round" \
 
 reset_mocks
 queue 1 claude APPROVED N/A N/A
-queue 2 codex APPROVED YES "$(rid 1 0 claude initial)"
+queue 2 codex APPROVED YES "$(rid 1 0 claude initial)" none
 touch "$MOCK_STATE/no-model-1" "$MOCK_STATE/no-model-2"
 run_gencr m-none --codex=attack --codex-model=gpt-x
 P="$(pkg m-none)"

@@ -7,3 +7,7 @@ same value layouts, and the same "## Review notes" layout — with synthetic tex
                         "## Review notes" entries are a label followed by indented bullets. gencr rejected the report
                         (Fix "empty"; notes "must start on the label line"); under the block-value grammar it is valid
                         as written.
+
+Contract v2 migration (2026-10-26, explicit positions): every finding gained "Introduced by this change: yes" after its
+Severity field, and the report gained empty "## Withdrawn findings" and "## Supplemental objections" sections. Nothing
+else changed.

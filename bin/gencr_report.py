@@ -14,7 +14,8 @@ becomes "<F>- <Label>: (<qualifier>) ...". Anything else that is invalid is irre
 
 import re
 
-FIELD_LABELS = ("Severity", "File", "Problem", "Evidence", "Expected vs actual", "Tests", "Fix")
+FIELD_LABELS = ("Severity", "Introduced by this change", "File", "Problem", "Evidence", "Expected vs actual", "Tests",
+                "Fix")
 OPTIONAL_LABELS = ("Duplicate of",)
 LABELS = FIELD_LABELS + OPTIONAL_LABELS
 ID_RE = r"(?:CLAUDE|CODEX)-[0-9]+"
@@ -26,7 +27,7 @@ FIELD_LIKE_RE = re.compile(r"^- (" + LABEL_ALT + r")(?: \([^()\n]*\))?:")
 LABEL_LIKE_RE = re.compile(r"^- [A-Za-z][A-Za-z ]*(?: \(.*\))?:")
 NONE_RE = re.compile(r"^[-*]?\s*none\.?\s*$", re.I)
 # Single-line fields: their consumers read one line, so they are text on the field line and nothing below it.
-SCALAR_LABELS = ("Severity", "File", "Duplicate of")
+SCALAR_LABELS = ("Severity", "Introduced by this change", "File", "Duplicate of")
 FINDING_HEADING_LIKE_RE = re.compile(r"^- \*\*" + ID_RE)
 SECTION_LIKE_RE = re.compile(r"^## ")  # any "## " line, as the section rule (CONTROL_RE) reads it
 CONTROL_LIKE_RE = re.compile(r"^(VERDICT|PEER-AGREEMENT|PEER-REPORT):")
@@ -107,8 +108,9 @@ class Value:
         return self.errors
 
 
-SECTIONS = ("Findings", "Disposition of peer findings", "Merge blockers", "Outstanding disputed findings",
-            "Previous findings verification", "Duplication check", "Review notes")
+SECTIONS = ("Findings", "Withdrawn findings", "Disposition of peer findings", "Merge blockers",
+            "Supplemental objections", "Outstanding disputed findings", "Previous findings verification",
+            "Duplication check", "Review notes")
 # "## Review notes": what the review instructions ask for that is not a finding, as these entries, once each, in order.
 NOTE_LABELS = ("Verified clean", "Unresolved risks", "Disproven claims", "Test gaps", "Out-of-scope ownership changes",
                "Other observations")
@@ -458,3 +460,188 @@ def continued_entries(lines, entry_re):
         else:
             current, pending = None, []
     return [(match, body) for match, body in entries]
+
+
+# ── Contract v2: explicit positions ───────────────────────────────────────────
+#
+# A reviewer's position on every finding is explicit and machine-readable; prose is rationale only.
+# - Own findings: Severity, "Introduced by this change: yes|no" and membership in its own "## Merge blockers".
+# - "## Disposition of peer findings": "- ID: accepted|disputed; introduced: yes|no; severity: critical|high|medium|low;
+#   blocking: yes|no — <rationale>", "- ID: rejected — <rationale>"; source-qualified rows "- ID (report <ID>): ..."
+#   keep a claim on a finding the other reviewer's latest report no longer defines (accepted, disputed, or withdrawn).
+# - "## Withdrawn findings": "- ID: withdrawn — <reason>" for own findings the reviewer no longer stands behind.
+# - "## Supplemental objections": the claimant's "- CLAUDE-O1 (CODEX-1; fix): raised|maintained|conceded|withdrawn —
+#   <rationale>" and the other reviewer's response "- CLAUDE-O1: accepted|rejected — <rationale>".
+
+REPORT_ID_RE = r"[0-9]{2}-round[0-9]+-(?:claude|codex)-(?:initial|attack|reconcile|respond)"
+SEVERITIES = ("critical", "high", "medium", "low")
+TOPICS = ("evidence", "fix", "scope", "other")
+DASH = r"(?:\u2014|\u2013| - )"
+ROW_RE = re.compile(r"^- \**(" + ID_RE + r")\**(?:\s*\(report (" + REPORT_ID_RE + r")\))?\**:\s*"
+                    r"(accepted|disputed|rejected|withdrawn)\b(.*)$", re.I)
+# Only spaces around the rationale separator: a CR, tab or U+2028 right after it is payload (as in contract v1).
+FACETS_RE = re.compile(r"^;\s*introduced:\s*(yes|no)\s*;\s*severity:\s*(critical|high|medium|low)\s*;\s*"
+                       r"blocking: *(yes|no) *" + DASH + r" *(.*)$", re.I)
+PLAIN_REST_RE = re.compile(r"^ *(?:\u2014|\u2013|:| - |- ) *(.*)$")
+WITHDRAWN_RE = re.compile(r"^- \**(" + ID_RE + r")\**:\s*withdrawn\b(.*)$", re.I)
+OBJECTION_ID_RE = r"(?:CLAUDE|CODEX)-O[0-9]+"
+CLAIM_RE = re.compile(r"^- (" + OBJECTION_ID_RE + r")\s*\((" + ID_RE + r");\s*([a-z]+)\):\s*"
+                      r"(raised|maintained|conceded|withdrawn)\b(.*)$", re.I)
+RESPONSE_RE = re.compile(r"^- (" + OBJECTION_ID_RE + r"):\s*(accepted|rejected)\b(.*)$", re.I)
+
+
+def severity_class(text):
+    lowered = (text or "").lower()
+    if "blocker" in lowered or "critical" in lowered:
+        return "critical"
+    for name in ("high", "medium", "low"):
+        if name in lowered:
+            return name
+    return "unknown"
+
+
+def fingerprint(finding):
+    """A finding definition's identity: its title and every field value, byte-exact."""
+    return [finding["title"], sorted(finding["values"].items())]
+
+
+def _rest(rest, body, where, errors):
+    """The rationale after the separator: first-line text plus continuation lines; it must not be empty."""
+    match = PLAIN_REST_RE.match(rest)
+    text = "\n".join(([match.group(1)] if match and match.group(1) else []) + body[1:])
+    if not match or not text.strip():
+        errors.append("%s needs \" — <rationale>\" after its status" % where)
+    return text
+
+
+def _section_entries(lines, name, entry_res, errors):
+    """The entries of one section: [(regex index, match, body)]; any other non-blank top-level line is an error."""
+    body = section_body(lines, name)
+    if body is None:
+        return None
+    content = [line for line in lines[body[0]:body[1]] if line.strip()]
+    if len(content) == 1 and NONE_RE.match(content[0]) and content[0].startswith("- "):
+        return []
+    entries, current = [], None
+    for line in lines[body[0]:body[1]]:
+        if not line.strip():
+            if current is not None:
+                current[2].append("")
+            continue
+        for kind, entry_re in enumerate(entry_res):
+            match = entry_re.match(line)
+            if match:
+                current = [kind, match, [line]]
+                entries.append(current)
+                break
+        else:
+            if current is not None and indent_of(line) >= 2:
+                current[2].append(line[2:])
+            else:
+                errors.append("'## %s' line is not a valid entry: %s" % (name, line.strip()))
+                current = None
+    for entry in entries:
+        while len(entry[2]) > 1 and not entry[2][-1].strip():
+            entry[2].pop()
+    return [tuple(entry) for entry in entries]
+
+
+def parse_positions(text):
+    """One report's explicit positions (contract v2): {findings, blockers, rows, withdrawn, objections, responses,
+    disputes, verdict, agreement, peer_report, errors}. Every rule that can be checked inside one report is checked
+    here; rules that need the run's history are checked by gencr_adjudicate.check_report."""
+    lines = text.split("\n")
+    errors = []
+    parsed = parse(text)
+    errors += parsed["errors"]
+    blockers = []
+    body = section_body(lines, "Merge blockers")
+    if body is not None:
+        for line in lines[body[0]:body[1]]:
+            match = re.match(r"^- \**(" + ID_RE + r")", line)
+            if match:
+                blockers.append(match.group(1))
+    findings = []
+    for f in parsed["findings"]:
+        introduced = (f["values"].get("Introduced by this change") or "").strip().lower()
+        if "Introduced by this change" in f["values"] and introduced not in ("yes", "no"):
+            errors.append("finding %s: 'Introduced by this change' must be yes or no" % f["id"])
+        findings.append({"id": f["id"], "title": f["title"], "values": f["values"],
+                         "severity": severity_class(f["values"].get("Severity")), "introduced": introduced or None,
+                         "blocking": f["id"] in blockers})
+    rows = []
+    for _, match, row_body in _section_entries(lines, "Disposition of peer findings", [ROW_RE], errors) or []:
+        identifier, source, status, rest = match.group(1).upper(), match.group(2), match.group(3).lower(), match.group(4)
+        where = "disposition row %s" % identifier
+        row = {"id": identifier, "source": source, "status": status, "introduced": None, "severity": None,
+               "blocking": None, "rationale": ""}
+        if status in ("accepted", "disputed"):
+            facets = FACETS_RE.match(rest)
+            if not facets:
+                errors.append("%s: write '- %s: %s; introduced: yes|no; severity: critical|high|medium|low; blocking: "
+                              "yes|no — <rationale>' (every facet is required)" % (where, identifier, status))
+            else:
+                row.update(introduced=facets.group(1).lower(), severity=facets.group(2).lower(),
+                           blocking=facets.group(3).lower() == "yes")
+                row["rationale"] = "\n".join(([facets.group(4)] if facets.group(4) else []) + row_body[1:])
+                if not row["rationale"].strip():
+                    errors.append("%s needs a rationale after its facets" % where)
+        else:
+            if status == "withdrawn" and source is None:
+                errors.append("%s: only a source-qualified row '- %s (report <ID>): withdrawn — <reason>' can withdraw "
+                              "a claim (withdraw your own finding under '## Withdrawn findings')" % (where, identifier))
+            row["rationale"] = _rest(rest, row_body, where, errors)
+        rows.append(row)
+    withdrawn = []
+    for _, match, w_body in _section_entries(lines, "Withdrawn findings", [WITHDRAWN_RE], errors) or []:
+        withdrawn.append({"id": match.group(1).upper(),
+                          "reason": _rest(match.group(2), w_body, "withdrawn finding %s" % match.group(1), errors)})
+    objections, responses = [], []
+    for kind, match, o_body in _section_entries(lines, "Supplemental objections", [CLAIM_RE, RESPONSE_RE], errors) or []:
+        if kind == 0:
+            topic = match.group(3).lower()
+            if topic not in TOPICS:
+                errors.append("supplemental objection %s: topic must be one of %s" % (match.group(1), ", ".join(TOPICS)))
+            objections.append({"id": match.group(1).upper(), "finding": match.group(2).upper(), "topic": topic,
+                               "status": match.group(4).lower(),
+                               "text": _rest(match.group(5), o_body, "supplemental objection %s" % match.group(1), errors)})
+        else:
+            responses.append({"id": match.group(1).upper(), "status": match.group(2).lower(),
+                              "text": _rest(match.group(3), o_body, "response to %s" % match.group(1), errors)})
+    disputes_body = section_body(lines, "Outstanding disputed findings")
+    disputes = parse_disputes(lines[disputes_body[0]:disputes_body[1]])[0] if disputes_body else []
+    tail = [line.strip() for line in lines if line.strip()][-3:]
+    control = {}
+    for line in tail:
+        key, _, value = line.partition(": ")
+        control[key] = value.strip()
+
+    # Consistency inside the report.
+    seen = {}
+    for kind, items in (("disposition row", rows), ("withdrawn finding", withdrawn), ("objection", objections),
+                        ("response", responses)):
+        for item in items:
+            key = (kind, item["id"])
+            if key in seen:
+                errors.append("%s %s appears more than once" % (kind, item["id"]))
+            seen[key] = True
+    own = {f["id"] for f in findings}
+    for item in withdrawn:
+        if item["id"] in own:
+            errors.append("finding %s is both defined and withdrawn" % item["id"])
+    blocking_rows = {r["id"] for r in rows if r["blocking"]}
+    for row in rows:
+        if row["status"] in ("rejected", "withdrawn") and row["id"] in blockers:
+            errors.append("merge blocker %s is %s in your disposition row" % (row["id"], row["status"]))
+        elif row["blocking"] is False and row["id"] in blockers:
+            errors.append("disposition row %s says blocking: no, but %s is listed under '## Merge blockers'"
+                          % (row["id"], row["id"]))
+        elif row["blocking"] and row["id"] not in blockers:
+            errors.append("disposition row %s says blocking: yes; list it under '## Merge blockers'" % row["id"])
+    for identifier in blockers:
+        if identifier not in own and identifier not in blocking_rows:
+            errors.append("merge blocker %s is neither your finding nor a peer finding you mark blocking: yes"
+                          % identifier)
+    return {"findings": findings, "blockers": blockers, "rows": rows, "withdrawn": withdrawn, "objections": objections,
+            "responses": responses, "disputes": disputes, "verdict": control.get("VERDICT"),
+            "agreement": control.get("PEER-AGREEMENT"), "peer_report": control.get("PEER-REPORT"), "errors": errors}

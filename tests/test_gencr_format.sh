@@ -64,6 +64,7 @@ malformed() {
 ## Findings
 - **${p}-1 Settings modal has no tests**
   - Severity: High
+  - Introduced by this change: yes
   - File: src/app.py:1
   - Problem: the modal component ships without tests
   - Evidence: no test file references the component
@@ -76,6 +77,7 @@ malformed() {
     - Keep the existing fixtures
 - **${p}-2 Imported config breaks the scheduled sync**
   - Severity: High
+  - Introduced by this change: yes
   - File: src/app.py:2
   - Problem: an empty config is accepted at import and rejected later
   - Evidence (traced, not executed):
@@ -91,6 +93,7 @@ malformed() {
   - Fix: validate at import
 - **${p}-3 Status is reported as success**
   - Severity: Medium
+  - Introduced by this change: yes
   - File: src/app.py:2
   - Problem: the stored status says success before any run
   - Evidence (traced, not executed): import with the complete config, then read the status; it is "success" != "pending"
@@ -99,6 +102,7 @@ malformed() {
   - Fix: store pending
 - **${p}-5 Concurrent saves race**
   - Severity: Medium
+  - Introduced by this change: yes
   - File: src/app.py:1
   - Problem: two saves can interleave
   - Evidence (interleaving, not executed): save A reads, save B writes, save A writes stale data
@@ -107,6 +111,7 @@ malformed() {
   - Fix: lock the row
 - **${p}-10 Downloads are unbounded**
   - Severity: High
+  - Introduced by this change: yes
   - File: src/app.py:1
   - Problem:
     - No size limit, so up to 256 MiB is read into memory.
@@ -119,6 +124,21 @@ malformed() {
   - Fix: add a bounded download
 EOF
 }
+# repeat_to_cap — replies 3..9 repeat replies 1 (claude, primary) and 2 (codex), each answering the previous report:
+# two reviewers that maintain their positions to the cap (claude-first order), copied byte for byte.
+repeat_to_cap() {
+  python3 -B - "$MOCK_STATE/responses" <<'PY'
+import os, re, sys
+d = sys.argv[1]
+ids = {1: "01-round0-claude-initial", 2: "02-round0-codex-attack", 3: "03-round1-claude-reconcile", 4: "04-round1-codex-respond",
+       5: "05-round1-claude-reconcile", 6: "06-round2-codex-respond", 7: "07-round2-claude-reconcile", 8: "08-round3-codex-respond"}
+for k in range(3, 10):
+    s = open(os.path.join(d, str(k - 2)), newline="").read()
+    s = re.sub(r"(?m)^PEER-REPORT: .*$", "PEER-REPORT: " + ids[k - 1], s)
+    s = re.sub(r"(?m)^PEER-AGREEMENT: N/A$", "PEER-AGREEMENT: NO", s)
+    open(os.path.join(d, str(k)), "w", newline="").write(s)
+PY
+}
 # report N AGENT VERDICT AGREEMENT PEER [BODY_FILE] — a queued response; findings from BODY_FILE (default: malformed).
 report() {
   local n="$1" agent="$2" verdict="$3" agreement="$4" peer="$5" body="${6:-}" up peer_up blockers disposition
@@ -127,13 +147,13 @@ report() {
   blockers="- None"; [ "$verdict" = "REQUEST CHANGES" ] && blockers="- ${up}-1"
   disposition="- None"
   if [ "$peer" != N/A ]; then
-    disposition="$(for k in 1 2 3 5 10; do printf -- '- %s-%s: disputed — needs evidence\n' "$peer_up" "$k"; done)"
+    disposition="$(for k in 1 2 3 5 10; do printf -- '- %s-%s: disputed; introduced: yes; severity: high; blocking: no — needs evidence\n' "$peer_up" "$k"; done)"
   fi
   {
     echo "Report from ${agent}."
     echo
     if [ -n "$body" ]; then cat "$body"; else malformed "$up" | sed 's/1 + \\$/1 + \\ /'; fi
-    printf '\n## Disposition of peer findings\n%s\n\n## Merge blockers\n%s\n\n## Outstanding disputed findings\n- None\n\n## Review notes\n- Verified clean: None\n- Unresolved risks: None\n- Disproven claims: None\n- Test gaps: None\n- Out-of-scope ownership changes: None\n- Other observations: None\n\n' \
+    printf '\n## Withdrawn findings\n- None\n\n## Disposition of peer findings\n%s\n\n## Merge blockers\n%s\n\n## Supplemental objections\n- None\n\n## Outstanding disputed findings\n- None\n\n## Review notes\n- Verified clean: None\n- Unresolved risks: None\n- Disproven claims: None\n- Test gaps: None\n- Out-of-scope ownership changes: None\n- Other observations: None\n\n' \
       "$disposition" "$blockers"
     printf 'VERDICT: %s\nPEER-AGREEMENT: %s\nPEER-REPORT: %s\n' "$verdict" "$agreement" "$peer"
   } > "$MOCK_STATE/responses/$n"
@@ -156,6 +176,7 @@ cat > "$WORK/multi.md" <<'EOF'
 ## Findings
 - **CLAUDE-1 T**
   - Severity: High
+  - Introduced by this change: yes
   - File: a.py:1
   - Problem: first line  
     second line, deeper
@@ -205,6 +226,7 @@ structural() {
   grammar 'print("; ".join(g.parse(open(sys.argv[1]).read())["errors"]))' "$WORK/case.md"
 }
 FIELDS_OK='  - Severity: High
+  - Introduced by this change: yes
   - File: a.py:1
   - Problem: p
   - Evidence: e
@@ -368,22 +390,26 @@ check "incremental sections are untouched by normalization" eval '[ -s "$WORK/in
 for order in claude codex; do
   if [ "$order" = claude ]; then p=claude a=codex flags="--codex=attack"; else p=codex a=claude flags="--codex=review --claude=attack"; fi
   reset_mocks
+  # Both reviewers maintain their disputes (contract v2 positions) to the cap; every reply is malformed the same way.
   report 1 "$p" "REQUEST CHANGES" N/A N/A
-  report 2 "$a" "REQUEST CHANGES" YES "$(rid 1 0 "$p" initial)"
+  report 2 "$a" "REQUEST CHANGES" NO "$(rid 1 0 "$p" initial)"
+  report 3 "$p" "REQUEST CHANGES" NO "$(rid 2 0 "$a" attack)"
+  for k in 4 6 8; do report "$k" "$a" "REQUEST CHANGES" NO "$(rid $((k - 1)) $(( k < 6 ? 1 : (k - 4) / 2 )) "$p" reconcile)"; done
+  for k in 5 7 9; do report "$k" "$p" "REQUEST CHANGES" NO "$(rid $((k - 1)) $(( (k - 3) / 2 )) "$a" respond)"; done
   # shellcheck disable=SC2086
   run_gencr $flags
   first="$(rid 1 0 "$p" initial)" second="$(rid 2 0 "$a" attack)"
-  check "$p-first: malformed reports are normalized and the review completes with no extra invocation" \
-    eval '[ "$STATUS" -eq 10 ] && [ "$(calls)" -eq 2 ] && contains "$ERR" "format normalized"'
+  check "$p-first: malformed reports are normalized; normalization adds no invocation (exactly the 9 scheduled calls)" \
+    eval '[ "$STATUS" -eq 10 ] && [ "$(calls)" -eq 9 ] && contains "$ERR" "format normalized"'
   check "$p-first: both reviewers' originals are kept byte-exact, normalized reports are consumed" \
     eval 'cmp -s "$PKG/$first.report.original.md" "$MOCK_STATE/responses/1" && cmp -s "$PKG/$second.report.original.md" "$MOCK_STATE/responses/2" &&
           ! cmp -s "$PKG/$first.report.md" "$PKG/$first.report.original.md" &&
           python3 -B "$REPO/bin/gencr_support.py" check-report --report "$PKG/$first.report.md"'
   check "$p-first: the adversary received the normalized primary report" \
     eval 'grep -qxF -- "  - Fix:" "$MOCK_STATE/call-2.stdin" && grep -qxF -- "    - Add a test file covering:" "$MOCK_STATE/call-2.stdin" && ! grep -qF -- "- Fix: - Add" "$MOCK_STATE/call-2.stdin"'
-  check "$p-first: metadata records each normalization; rounds unchanged" \
-    eval '[ "$(json_get "$PKG/metadata.json" "[i[\"format_normalization\"][\"result\"] for i in d[\"invocations\"]]")" = "['"'"'normalized'"'"', '"'"'normalized'"'"']" ] &&
-          [ "$(json_get "$PKG/metadata.json" "d[\"rounds\"]")" = 0 ] &&
+  check "$p-first: metadata records each normalization; the round count is the schedule's" \
+    eval '[ "$(json_get "$PKG/metadata.json" "sorted(set(i[\"format_normalization\"][\"result\"] for i in d[\"invocations\"])), len(d[\"invocations\"])")" = "['"'"'normalized'"'"'] 9" ] &&
+          [ "$(json_get "$PKG/metadata.json" "d[\"rounds\"]")" = 3 ] &&
           [ "$(json_get "$PKG/metadata.json" "len(d[\"invocations\"][0][\"format_normalization\"][\"repairs\"])")" = 3 ]'
   check "$p-first: findings.json and the full report carry complete multiline values" \
     eval '[ "$(json_get "$PKG/findings.json" "[f for f in d[\"final_findings\"] if f[\"id\"].endswith(\"-10\")][0][\"fields\"][\"Problem\"].count(chr(10))")" = 3 ] &&
@@ -406,8 +432,8 @@ for step in "claude APPROVED N/A N/A" "codex REQUEST\ CHANGES NO $(rid 1 0 claud
   n=$((n + 1))
 done
 run_gencr --codex=attack
-check "final round: every malformed report is normalized; still exactly 9 invocations and 3 rounds" \
-  eval '[ "$STATUS" -eq 11 ] && [ "$(calls)" -eq 9 ] && [ "$(json_get "$PKG/metadata.json" "d[\"rounds\"]")" = 3 ] &&
+check "final round: every malformed report is normalized; still exactly 9 invocations and 3 rounds; the primary's APPROVED applies" \
+  eval '[ "$STATUS" -eq 0 ] && [ "$(calls)" -eq 9 ] && [ "$(json_get "$PKG/metadata.json" "d[\"rounds\"]")" = 3 ] &&
         [ "$(ls "$PKG"/*.report.original.md | wc -l | tr -d " ")" -eq 9 ] && [ -f "$PKG/$(rid 9 3 claude reconcile).normalization.json" ]'
 
 # Irreparable: INCOMPLETE, original kept as the report, the peer is never launched.
@@ -458,17 +484,23 @@ cat > "$MOCK_STATE/responses/2" <<EOF
 ## Findings
 - None
 
+## Withdrawn findings
+- None
+
 ## Disposition of peer findings
 - CLAUDE-1: rejected — the test exists:
   - see tests/test_app.py:12
   - it asserts both states
-- CLAUDE-2: accepted — confirmed
-- CLAUDE-3: accepted — confirmed
-- CLAUDE-5: accepted — confirmed
-- CLAUDE-10: accepted — confirmed
+- CLAUDE-2: accepted; introduced: yes; severity: high; blocking: yes — confirmed
+- CLAUDE-3: accepted; introduced: yes; severity: medium; blocking: no — confirmed
+- CLAUDE-5: accepted; introduced: yes; severity: medium; blocking: no — confirmed
+- CLAUDE-10: accepted; introduced: yes; severity: high; blocking: no — confirmed
 
 ## Merge blockers
 - CLAUDE-2
+
+## Supplemental objections
+- None
 
 ## Outstanding disputed findings
 - None
@@ -485,6 +517,8 @@ VERDICT: REQUEST CHANGES
 PEER-AGREEMENT: YES
 PEER-REPORT: $(rid 1 0 claude initial)
 EOF
+# CLAUDE-1 stays rejected (a real disagreement): both reviewers maintain their replies to the cap.
+repeat_to_cap
 run_gencr --codex=attack
 check "disposition evidence keeps its continuation lines in findings.json" \
   eval '[ "$STATUS" -eq 10 ] && [ "$(json_get "$PKG/findings.json" "d[\"dispositions\"][\"codex\"][0][\"evidence\"]")" = "the test exists:
@@ -495,14 +529,14 @@ check "disposition evidence keeps its continuation lines in findings.json" \
 reset_mocks
 (cd "$TARGET" && "$REPO/bin/gencr" dev --codex=attack --print) > "$WORK/prompt" 2>/dev/null
 check "the prompt states the value grammar (single-line scalars, blocks directly below) and qualifiers in the value" \
-  eval 'grep -qF "Severity, File and Duplicate of are each one line of text on the field line, with nothing below it." "$WORK/prompt" && grep -qF "in a block of lines directly below it (no blank line before the first one)" "$WORK/prompt" && ! grep -qF "Never leave a field line empty" "$WORK/prompt" && grep -qF "\"- Evidence: (traced, not executed) ...\", not \"- Evidence (traced, not executed):\"" "$WORK/prompt"'
+  eval 'grep -qF "Severity, Introduced by this change, File and Duplicate of are each one line of text on the field line, with nothing below it." "$WORK/prompt" && grep -qF "in a block of lines directly below it (no blank line before the first one)" "$WORK/prompt" && ! grep -qF "Never leave a field line empty" "$WORK/prompt" && grep -qF "\"- Evidence: (traced, not executed) ...\", not \"- Evidence (traced, not executed):\"" "$WORK/prompt"'
 
 # ── Revision 1 (codex FMT-I1..I3, C1): lossless bytes, tab-only lines, complete disposition evidence ──
 
 # raw_report N AGENT PYTHON-BYTES-EXPR — a queued response written as exact bytes (the mock passes them through).
 raw_report() { python3 -B -c 'import sys; open(sys.argv[1], "wb").write(eval(sys.argv[2]))' "$MOCK_STATE/responses/$1" "$3"; }
-FIELDS_BYTES='b"## Findings\n- **CODEX-1 T**\n  - Severity: High\n  - File: src/app.py:1\n  - Problem: p\n  - Expected vs actual: x\n  - Tests: t\n"'
-TAIL_BYTES='b"\n## Disposition of peer findings\n- None\n\n## Merge blockers\n- CODEX-1\n\n## Outstanding disputed findings\n- None\n\n## Review notes\n- Verified clean: None\n- Unresolved risks: None\n- Disproven claims: None\n- Test gaps: None\n- Out-of-scope ownership changes: None\n- Other observations: None\n\nVERDICT: REQUEST CHANGES\nPEER-AGREEMENT: N/A\nPEER-REPORT: N/A\n"'
+FIELDS_BYTES='b"## Findings\n- **CODEX-1 T**\n  - Severity: High\n  - Introduced by this change: yes\n  - File: src/app.py:1\n  - Problem: p\n  - Expected vs actual: x\n  - Tests: t\n"'
+TAIL_BYTES='b"\n## Withdrawn findings\n- None\n\n## Disposition of peer findings\n- None\n\n## Merge blockers\n- CODEX-1\n\n## Supplemental objections\n- None\n\n## Outstanding disputed findings\n- None\n\n## Review notes\n- Verified clean: None\n- Unresolved risks: None\n- Disproven claims: None\n- Test gaps: None\n- Out-of-scope ownership changes: None\n- Other observations: None\n\nVERDICT: REQUEST CHANGES\nPEER-AGREEMENT: N/A\nPEER-REPORT: N/A\n"'
 
 # FMT-I1: a carriage return in evidence is payload; it survives normalization, validation and packaging.
 reset_mocks
@@ -551,18 +585,24 @@ cat > "$MOCK_STATE/responses/2" <<EOF
 ## Findings
 - None
 
+## Withdrawn findings
+- None
+
 ## Disposition of peer findings
-- CLAUDE-1: accepted — -1 is the observed return value
+- CLAUDE-1: accepted; introduced: yes; severity: high; blocking: yes — -1 is the observed return value
   first continuation
 
   last continuation
 - CLAUDE-2: rejected — \`module.py:1\` already validates
-- CLAUDE-3: disputed: needs a test
-- CLAUDE-5: accepted - plain hyphen delimiter
-- CLAUDE-10: accepted —confirmed
+- CLAUDE-3: disputed; introduced: yes; severity: medium; blocking: no — needs a test
+- CLAUDE-5: accepted; introduced: yes; severity: medium; blocking: no - plain hyphen delimiter
+- CLAUDE-10: accepted; introduced: yes; severity: high; blocking: no —confirmed
 
 ## Merge blockers
 - CLAUDE-1
+
+## Supplemental objections
+- None
 
 ## Outstanding disputed findings
 - None
@@ -579,10 +619,11 @@ VERDICT: REQUEST CHANGES
 PEER-AGREEMENT: YES
 PEER-REPORT: $(rid 1 0 claude initial)
 EOF
+repeat_to_cap
 run_gencr --codex=attack
 check "disposition evidence: sign, paragraph break and continuation exact" \
   eval '[ "$STATUS" -eq 10 ] && [ "$(json_get "$PKG/findings.json" "repr(d[\"dispositions\"][\"codex\"][0][\"evidence\"])")" = "'"'"'-1 is the observed return value\\nfirst continuation\\n\\nlast continuation'"'"'" ]'
-check "disposition evidence: opening backtick, colon and hyphen delimiters" \
+check "disposition evidence: opening backtick, rejected and hyphen delimiters, no space after the dash" \
   eval '[ "$(json_get "$PKG/findings.json" "[e[\"evidence\"] for e in d[\"dispositions\"][\"codex\"][1:]]")" = "['"'"'\`module.py:1\` already validates'"'"', '"'"'needs a test'"'"', '"'"'plain hyphen delimiter'"'"', '"'"'confirmed'"'"']" ]'
 check "previous-verification entries use the same parser" \
   eval '[ "$(python3 -B -c "import sys; sys.path.insert(0, sys.argv[1]); import gencr_support as s; print(repr(s.parse_dispositions([\"- CLAUDE-3: fixed — \`module.py:1\` returns -1\", \"\", \"  after a blank\"], \"not fixed|fixed|obsolete\")[0][\"evidence\"]))" "$REPO/bin")" = "'"'"'\`module.py:1\` returns -1\\n\\nafter a blank'"'"'" ]'
@@ -616,7 +657,7 @@ check "Claude envelope with invalid UTF-8: reviewer failure, no report, no norma
 reset_mocks
 python3 -B -c 'import json,sys; open(sys.argv[1], "wb").write(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": open(sys.argv[2]).read().replace("ends in CR", "ends in CR\r")}).encode())' \
   "$MOCK_STATE/raw-stdout-1" /dev/stdin <<EOF
-$(printf '## Findings\n- **CLAUDE-1 T**\n  - Severity: High\n  - File: src/app.py:1\n  - Problem: p\n  - Evidence: ends in CR\n  - Expected vs actual: x\n  - Tests: t\n  - Fix: f\n\n## Disposition of peer findings\n- None\n\n## Merge blockers\n- None\n\n## Outstanding disputed findings\n- None\n\n## Review notes\n- Verified clean: None\n- Unresolved risks: None\n- Disproven claims: None\n- Test gaps: None\n- Out-of-scope ownership changes: None\n- Other observations: None\n\nVERDICT: APPROVED\nPEER-AGREEMENT: N/A\nPEER-REPORT: N/A')
+$(printf '## Findings\n- **CLAUDE-1 T**\n  - Severity: High\n  - Introduced by this change: yes\n  - File: src/app.py:1\n  - Problem: p\n  - Evidence: ends in CR\n  - Expected vs actual: x\n  - Tests: t\n  - Fix: f\n\n## Withdrawn findings\n- None\n\n## Disposition of peer findings\n- None\n\n## Merge blockers\n- None\n\n## Supplemental objections\n- None\n\n## Outstanding disputed findings\n- None\n\n## Review notes\n- Verified clean: None\n- Unresolved risks: None\n- Disproven claims: None\n- Test gaps: None\n- Out-of-scope ownership changes: None\n- Other observations: None\n\nVERDICT: APPROVED\nPEER-AGREEMENT: N/A\nPEER-REPORT: N/A')
 EOF
 run_gencr
 check "a valid Claude envelope with an escaped CR still works and keeps the CR" \
@@ -627,10 +668,13 @@ reset_mocks
 report 1 claude "REQUEST CHANGES" N/A N/A
 python3 -B - "$MOCK_STATE/responses/2" "$(rid 1 0 claude initial)" <<'EOF'
 import sys
-body = ("## Findings\n- None\n\n## Disposition of peer findings\n"
-        "- CLAUDE-1: accepted — \r-1 is the observed return value\n- CLAUDE-2: accepted —  kept\n"
-        "- CLAUDE-3: accepted — confirmed\n- CLAUDE-5: accepted — confirmed\n- CLAUDE-10: accepted — confirmed\n\n"
-        "## Merge blockers\n- CLAUDE-1\n\n## Outstanding disputed findings\n- None\n\n"
+body = ("## Findings\n- None\n\n## Withdrawn findings\n- None\n\n## Disposition of peer findings\n"
+        "- CLAUDE-1: accepted; introduced: yes; severity: high; blocking: yes — \r-1 is the observed return value\n"
+        "- CLAUDE-2: accepted; introduced: yes; severity: high; blocking: no —  kept\n"
+        "- CLAUDE-3: accepted; introduced: yes; severity: medium; blocking: no — confirmed\n"
+        "- CLAUDE-5: accepted; introduced: yes; severity: medium; blocking: no — confirmed\n"
+        "- CLAUDE-10: accepted; introduced: yes; severity: high; blocking: no — confirmed\n\n"
+        "## Merge blockers\n- CLAUDE-1\n\n## Supplemental objections\n- None\n\n## Outstanding disputed findings\n- None\n\n"
         "## Review notes\n- Verified clean: None\n- Unresolved risks: None\n- Disproven claims: None\n- Test gaps: None\n- Out-of-scope ownership changes: None\n- Other observations: None\n\n"
         "VERDICT: REQUEST CHANGES\nPEER-AGREEMENT: YES\nPEER-REPORT: %s\n" % sys.argv[2])
 open(sys.argv[1], "w", encoding="utf-8", newline="").write(body)

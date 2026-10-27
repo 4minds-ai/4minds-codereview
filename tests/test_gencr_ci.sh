@@ -392,6 +392,101 @@ EOF
 publish "$WORK/art-approved" 107
 check "a failed status update makes publishing fail visibly" eval '[ "$STATUS" -ne 0 ] && contains "$ERR" "publishing failed"'
 
+# ── Primary-reviewer authority in publication ──────────────────────────────────
+
+# Claude (primary) approves; Codex requests changes to the cap: APPROVED by authority, a success status, not unanimous.
+(MOCK_VERDICT_CODEX="REQUEST CHANGES" make_package "$WORK/out-authority" APPROVED --codex=attack)
+run_ci package --output-dir "$WORK/out-authority" --pr-number 7 --backend mock --out "$WORK/art-authority"
+reset_gh
+publish "$WORK/art-authority" 300
+BODY="$(gh_eval 'd["comments"][0]["body"]')"
+check "authority APPROVED with attacker objections: success status whose description says NOT UNANIMOUS" \
+  eval '[ "$STATUS" -eq 0 ] && [ "$(gh_eval "d[\"statuses\"][-1][\"state\"]")" = success ] &&
+        contains "$(gh_eval "d[\"statuses\"][-1][\"description\"]")" "APPROVED by primary reviewer — NOT UNANIMOUS; 1 attacker objections remain" &&
+        contains "$OUT" "outcome=APPROVED"'
+check "authority APPROVED: the PR comment carries the qualification, both verdicts and the attacker objection" \
+  eval 'contains "$BODY" "- APPROVED by primary reviewer — NOT UNANIMOUS; 1 attacker objections remain." && contains "$BODY" "- Verdicts: Claude (primary): APPROVED; Codex (attacker): REQUEST CHANGES" &&
+        contains "$BODY" "### Attacker objections" && contains "$BODY" "**CODEX-1**" && ! contains "$BODY" "unanimous: both"'
+
+# Claude (primary) requests changes; Codex approves: REQUEST CHANGES by authority, a failure status.
+(MOCK_VERDICT_CODEX=APPROVED make_package "$WORK/out-authority-rc" "REQUEST CHANGES" --codex=attack)
+run_ci package --output-dir "$WORK/out-authority-rc" --pr-number 7 --backend mock --out "$WORK/art-authority-rc"
+reset_gh
+publish "$WORK/art-authority-rc" 301
+check "authority REQUEST CHANGES with an approving attacker: failure status, not unanimous" \
+  eval '[ "$STATUS" -eq 0 ] && [ "$(gh_eval "d[\"statuses\"][-1][\"state\"]")" = failure ] &&
+        contains "$(gh_eval "d[\"statuses\"][-1][\"description\"]")" "REQUEST CHANGES by primary reviewer — NOT UNANIMOUS" &&
+        contains "$(gh_eval "d[\"comments\"][0][\"body\"]")" "- Verdicts: Claude (primary): REQUEST CHANGES; Codex (attacker): APPROVED"'
+
+# A tampered adjudication (claims unanimity), re-hashed so the manifest still verifies: never a success.
+cp -R "$WORK/art-authority" "$WORK/art-tampered-adj"
+py 'import hashlib, json, os, sys
+d = sys.argv[1]
+m = json.load(open(os.path.join(d, "metadata.json"))); m["adjudication"]["unanimous"] = True
+data = json.dumps(m, indent=2) + "\n"; open(os.path.join(d, "metadata.json"), "w").write(data)
+x = json.load(open(os.path.join(d, "manifest.json"))); x["files"]["metadata.json"] = hashlib.sha256(data.encode()).hexdigest()
+open(os.path.join(d, "manifest.json"), "w").write(json.dumps(x, indent=2) + "\n")' "$WORK/art-tampered-adj/code-review-pr-7"
+reset_gh
+publish "$WORK/art-tampered-adj" 302
+check "a tampered adjudication is published as an infrastructure failure (error status), never as an approval" \
+  eval '[ "$(gh_eval "d[\"statuses\"][-1][\"state\"]")" = error ] && contains "$(gh_eval "d[\"comments\"][0][\"body\"]")" "INFRASTRUCTURE FAILURE" &&
+        contains "$(gh_eval "d[\"comments\"][0][\"body\"]")" "adjudication is invalid"'
+
+# A typed tamper applied consistently to metadata.json and findings.json (a blocking position as the string "yes",
+# needs_another_round as the string "false", the primary report pointing at the attacker's): never a verdict.
+cp -R "$WORK/art-authority" "$WORK/art-typed-adj"
+py 'import hashlib, json, os, sys
+d = sys.argv[1]
+x = json.load(open(os.path.join(d, "manifest.json")))
+for name in ("metadata.json", "findings.json"):
+    doc = json.load(open(os.path.join(d, name))); adj = doc["adjudication"]
+    adj["primary_report"] = adj["attacker_report"]; adj["needs_another_round"] = "false"
+    for f in adj["findings"].values():
+        for p in f["positions"].values():
+            p["blocking"] = "yes" if p["blocking"] else p["blocking"]
+    data = json.dumps(doc, indent=2) + "\n"; open(os.path.join(d, name), "w").write(data)
+    x["files"][name] = hashlib.sha256(data.encode()).hexdigest()
+open(os.path.join(d, "manifest.json"), "w").write(json.dumps(x, indent=2) + "\n")' "$WORK/art-typed-adj/code-review-pr-7"
+reset_gh
+publish "$WORK/art-typed-adj" 303
+check "an ill-typed, mis-bound adjudication is published as an infrastructure failure (error status)" \
+  eval '[ "$(gh_eval "d[\"statuses\"][-1][\"state\"]")" = error ] && contains "$(gh_eval "d[\"comments\"][0][\"body\"]")" "adjudication is invalid"'
+
+# findings.json's adjudication edited alone (re-hashed): the package's two representations differ -> never a verdict.
+cp -R "$WORK/art-authority" "$WORK/art-split-adj"
+py 'import hashlib, json, os, sys
+d = sys.argv[1]
+doc = json.load(open(os.path.join(d, "findings.json"))); doc["adjudication"]["counts"]["agreed"] += 1
+data = json.dumps(doc, indent=2) + "\n"; open(os.path.join(d, "findings.json"), "w").write(data)
+x = json.load(open(os.path.join(d, "manifest.json"))); x["files"]["findings.json"] = hashlib.sha256(data.encode()).hexdigest()
+open(os.path.join(d, "manifest.json"), "w").write(json.dumps(x, indent=2) + "\n")' "$WORK/art-split-adj/code-review-pr-7"
+reset_gh
+publish "$WORK/art-split-adj" 304
+check "metadata.json and findings.json adjudications that differ are an infrastructure failure, never a verdict" \
+  eval '[ "$(gh_eval "d[\"statuses\"][-1][\"state\"]")" = error ] &&
+        contains "$(gh_eval "d[\"comments\"][0][\"body\"]")" "differs between metadata.json and findings.json"'
+
+# SD-I4-R1: the author's current position contradicts the peer's current-version assessment (both copies edited
+# consistently, every facet still stored as agreed): never published as a verdict.
+cp -R "$WORK/art-authority" "$WORK/art-contradict-adj"
+py 'import hashlib, json, os, sys
+d = sys.argv[1]
+x = json.load(open(os.path.join(d, "manifest.json")))
+for name in ("metadata.json", "findings.json"):
+    doc = json.load(open(os.path.join(d, name)))
+    for f in doc["adjudication"]["findings"].values():
+        p = f["positions"][f["author"]]
+        if p["existence"] == "asserted":
+            p["severity"] = "low" if p["severity"] != "low" else "high"
+    data = json.dumps(doc, indent=2) + "\n"; open(os.path.join(d, name), "w").write(data)
+    x["files"][name] = hashlib.sha256(data.encode()).hexdigest()
+open(os.path.join(d, "manifest.json"), "w").write(json.dumps(x, indent=2) + "\n")' "$WORK/art-contradict-adj/code-review-pr-7"
+reset_gh
+publish "$WORK/art-contradict-adj" 305
+check "an adjudication whose current positions contradict each other is an infrastructure failure, never a verdict" \
+  eval '[ "$(gh_eval "d[\"statuses\"][-1][\"state\"]")" = error ] &&
+        contains "$(gh_eval "d[\"comments\"][0][\"body\"]")" "adjudication is invalid"'
+
 # ── find-previous ──────────────────────────────────────────────────────────────
 
 seed_previous() { # run-id artifact-dir [workflow-path] [expired] [login] [marker-artifact-dir] [marker-backend]
